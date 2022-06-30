@@ -33,7 +33,7 @@ static u_char ngx_http_error_build_tail[] =
 
 
 static u_char ngx_http_error_tail[] =
-"<hr><center>" NGINX_VER_BUILD "</center>" CRLF
+"<hr><center>openresty</center>" CRLF
 "</body>" CRLF
 "</html>" CRLF
 ;
