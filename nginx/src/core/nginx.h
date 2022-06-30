@@ -9,9 +9,9 @@
 #define _NGINX_H_INCLUDED_
 
 
-#define nginx_version      1021004
-#define NGINX_VERSION      "1.21.4"
-#define NGINX_VER          "openresty/" NGINX_VERSION ".1"
+#define nginx_version      9999999
+#define NGINX_VERSION      "99.99.999"
+#define NGINX_VER          "Fungit/" NGINX_VERSION ".9"
 
 #ifdef NGX_BUILD
 #define NGINX_VER_BUILD    NGINX_VER " (" NGX_BUILD ")"
@@ -19,7 +19,7 @@
 #define NGINX_VER_BUILD    NGINX_VER
 #endif
 
-#define NGINX_VAR          "NGINX"
+#define NGINX_VAR          "FUNGIT"
 #define NGX_OLDPID_EXT     ".oldbin"
 
 
