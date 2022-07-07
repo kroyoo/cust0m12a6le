@@ -184,6 +184,15 @@ function user_agent_attack_check()
         local USER_AGENT_RULES = get_rule("useragent")
         local USER_AGENT = ngx.var.http_user_agent
         if USER_AGENT ~= nil then
+
+            -- bad code
+            if rulematch(string.lower(USER_AGENT),"qq","jo") or rulematch(string.lower(USER_AGENT),"micromessenger","jo") then
+                if config_waf_enable == "on" then
+                        waf_wechat_qq_output()
+                        return true
+                end
+            end
+
             for _,rule in pairs(USER_AGENT_RULES) do
                 if rule ~="" and rulematch(string.lower(USER_AGENT),string.lower(rule),"jo") then
                     log_record("Deny_User_Agent",ngx.var.request_uri,"-",rule)

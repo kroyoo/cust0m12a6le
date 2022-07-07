@@ -104,3 +104,15 @@ function waf_output()
         ngx.exit(ngx.status)
     end
 end
+
+-- WAF return
+function waf_wechat_qq_output()
+    if config_waf_output == "redirect" then
+        ngx.redirect(config_waf_redirect_url, 301)
+    else
+        ngx.header.content_type = "text/html"
+        ngx.status = ngx.HTTP_FORBIDDEN
+        ngx.say(config_weichat_qq_output_html)
+        ngx.exit(ngx.status)
+    end
+end
