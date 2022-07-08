@@ -112,7 +112,7 @@ function waf_wechat_qq_output()
     else
         ngx.header.content_type = "text/html"
         ngx.status = ngx.HTTP_FORBIDDEN
-        ngx.say(config_weichat_qq_output_html)
+        ngx.say(config_wechat_qq_output_html)
         ngx.exit(ngx.status)
     end
 end

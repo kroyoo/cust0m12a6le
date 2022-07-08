@@ -30,7 +30,7 @@ function black_ip_check()
         if IP_BLACK_RULE ~= nil then
             for _,rule in pairs(IP_BLACK_RULE) do
                 if rule ~= "" and rulematch(BLACK_IP,rule,"jo") then
-                    -- log_record('BlackList_IP',ngx.var.request_uri,"_","_")                    
+                    -- log_record('BlackList_IP',ngx.var.request_uri,"_","_")          
                     if config_waf_enable == "on" then
                         ngx.header.content_type = "text/html"
                         ngx.say('Your IP blacklist, Please contact the administrator! ')
@@ -113,7 +113,7 @@ function cookie_attack_check()
         if USER_COOKIE ~= nil then
             for _,rule in pairs(COOKIE_RULES) do
                 if rule ~="" and rulematch(string.lower(USER_COOKIE),string.lower(rule),"jo") then
-                    log_record("Deny_Cookie",ngx.var.request_uri,"-",rule)                    
+                    log_record("Deny_Cookie",ngx.var.request_uri,"-",rule)             
                     if config_waf_enable == "on" then
                         waf_output()
                         return true
@@ -132,7 +132,7 @@ function url_attack_check()
         local REQ_URI = ngx.var.request_uri
         for _,rule in pairs(URL_RULES) do
             if rule ~="" and rulematch(string.lower(REQ_URI),string.lower(rule),"jo") then
-                log_record("Deny_URL",REQ_URI,"-",rule)                
+                log_record("Deny_URL",REQ_URI,"-",rule)
                 if config_waf_enable == "on" then
                     waf_output()
                     return true
@@ -166,7 +166,7 @@ function url_args_attack_check()
                     ARGS_DATA = string.lower(val)
                 end
                 if ARGS_DATA and type(ARGS_DATA) ~= "boolean" and rule ~="" and rulematch(unescape(ARGS_DATA),string.lower(rule),"jo") then
-                    log_record("Deny_URL_Args",ngx.var.request_uri,"-",rule)                    
+                    log_record("Deny_URL_Args",ngx.var.request_uri,"-",rule)           
                     if config_waf_enable == "on" then
                         waf_output()
                         return true
@@ -184,7 +184,6 @@ function user_agent_attack_check()
         local USER_AGENT_RULES = get_rule("useragent")
         local USER_AGENT = ngx.var.http_user_agent
         if USER_AGENT ~= nil then
-
             -- bad code
             if rulematch(string.lower(USER_AGENT),"qq","jo") or rulematch(string.lower(USER_AGENT),"micromessenger","jo") then
                 if config_waf_enable == "on" then
@@ -230,7 +229,7 @@ function post_attack_check()
                     POST_DATA = string.lower(val)
                 end
                 if POST_DATA and rule ~="" and rulematch(unescape(POST_DATA),string.lower(rule),"jo") then
-                    log_record("Deny_POST",ngx.var.request_uri,"-",rule)                    
+                    log_record("Deny_POST",ngx.var.request_uri,"-",rule)               
                     if config_waf_enable == "on" then
                         waf_output()
                         return true
