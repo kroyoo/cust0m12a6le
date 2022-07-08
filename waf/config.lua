@@ -5,7 +5,7 @@ config_waf_enable = "on"
 --log dir
 config_log_dir = "/data/wwwlogs"
 --rule setting
-config_rule_dir = "/usr/local/nginx/conf/waf/wafconf"
+config_rule_dir = "/usr/local/openresty/nginx/conf/waf/wafconf"
 --enable/disable white url
 config_white_url_check = "on"
 --enable/disable white ip
@@ -32,11 +32,11 @@ config_waf_output = "html"
 config_waf_redirect_url = "/captcha"
 config_waf_captcha_html=[[
 <html>
-	<head>
-		<meta http-equiv="content-type" content="text/html; charset=UTF-8">
-		<title data-sw-translate>Please enter verification code - OneinStack WAF</title>
-		<style>
-			body { font-family: Tahoma, Verdana, Arial, sans-serif; }
+        <head>
+                <meta http-equiv="content-type" content="text/html; charset=UTF-8">
+                <title data-sw-translate>Please enter verification code - OneinStack WAF</title>
+                <style>
+                        body { font-family: Tahoma, Verdana, Arial, sans-serif; }
                         .head_title{margin-top:100px; font-family:"微软雅黑"; font-size:50px; font-weight:lighter;}
                         p{font-family:"微软雅黑"; font-size:16px; font-weight:lighter; color:#666666;}
                         .btn{ float:left;margin-left:15px; margin-top:5px; width:85px; height:30px; background:#56c458;font-family:"微软雅黑"; font-size:16px; color:#FFFFFF; border:0;}
@@ -45,96 +45,96 @@ config_waf_captcha_html=[[
                         .fors{ margin:0 auto;width:500px; height:40px;}
                 .form {width: 500px; margin: 2em auto;}
         </style>
-	</head>
-	<body>
-		<div align="center">
-			<p>
-				<h1 class="head_title" data-sw-translate>Sorry...</h1>
-			</p>
-			<p data-sw-translate>Your query looks similar to an automated request from computer software. In order to protect
-				our users, please forgive us for temporarily not processing your request.</p>
-			<p data-sw-translate>To continue accessing the webpage, please enter the characters shown below:</p>
-			<div class="form">
-				<img id="captcha-img" class="yz" src="https://oneinstack.com/api/v1/captcha/BrqDr57p3mjj0xAuEQEW.png" alt="Captcha image">
-				<input id="captcha-input" class="inp_s" type="text" name="response" />
-				<input id="captcha-id" class="inp_s" type="hidden" name="response" />
-				 <input id="captcha-submit" class="btn" type="submit"
-				 data-sw-translate value="Submit" />
-			</div>
-		</div>
-		<script src="https://cdn.bootcss.com/jquery/3.3.1/jquery.min.js"></script>
-		<script>
-			let captcha_id = ''
-			var url = 'https://oneinstack.com/api/v1/captcha'
-			var urlimg = 'https://oneinstack.com/api/v1'
-			// 获取验证码 hash
-			getImg()
-			function getImg() {
-				$.get(url).then((res) => {
-					$('#captcha-img').attr('src', urlimg + res.data.image_url)
-					$('#captcha-id').val(res.data.captcha_id)
-				})				
-			}
-			$('#captcha-img').on('click',function(e) {
-				getImg()
-			})
-			$('#captcha-submit').on('click', function(e) {
-				var data = {
-					captcha_id: $('#captcha-id').val(),
-					captcha_code: document.querySelector('#captcha-input').value,					
-				}
+        </head>
+        <body>
+                <div align="center">
+                        <p>
+                                <h1 class="head_title" data-sw-translate>Sorry...</h1>
+                        </p>
+                        <p data-sw-translate>Your query looks similar to an automated request from computer software. In order to protect
+                                our users, please forgive us for temporarily not processing your request.</p>
+                        <p data-sw-translate>To continue accessing the webpage, please enter the characters shown below:</p>
+                        <div class="form">
+                                <img id="captcha-img" class="yz" src="https://oneinstack.com/api/v1/captcha/BrqDr57p3mjj0xAuEQEW.png" alt="Captcha image">
+                                <input id="captcha-input" class="inp_s" type="text" name="response" />
+                                <input id="captcha-id" class="inp_s" type="hidden" name="response" />
+                                 <input id="captcha-submit" class="btn" type="submit"
+                                 data-sw-translate value="Submit" />
+                        </div>
+                </div>
+                <script src="https://cdn.bootcss.com/jquery/3.3.1/jquery.min.js"></script>
+                <script>
+                        let captcha_id = ''
+                        var url = 'https://oneinstack.com/api/v1/captcha'
+                        var urlimg = 'https://oneinstack.com/api/v1'
+                        // 获取验证码 hash
+                        getImg()
+                        function getImg() {
+                                $.get(url).then((res) => {
+                                        $('#captcha-img').attr('src', urlimg + res.data.image_url)
+                                        $('#captcha-id').val(res.data.captcha_id)
+                                })
+                        }
+                        $('#captcha-img').on('click',function(e) {
+                                getImg()
+                        })
+                        $('#captcha-submit').on('click', function(e) {
+                                var data = {
+                                        captcha_id: $('#captcha-id').val(),
+                                        captcha_code: document.querySelector('#captcha-input').value,
+                                }
 
                 $.ajax({
                     url: `${url}/verify`,
                     type: 'post',
                     dataType: 'json',
-					contentType: 'application/json',
+                                        contentType: 'application/json',
                     data: JSON.stringify(data),
-					cache: false,
+                                        cache: false,
                     success: function(res){
-						var targetUrl = new URLSearchParams(location.search).get('continue')
-						targetUrl = atob(targetUrl)
-						location.href = targetUrl
+                                                var targetUrl = new URLSearchParams(location.search).get('continue')
+                                                targetUrl = atob(targetUrl)
+                                                location.href = targetUrl
                     },
                     error: function(e) {
-						location.reload()
+                                                location.reload()
                     }
                 })
 
-			})
-			window.SwaggerTranslator = {
-				_words: [],
-				translate: function() {
-					var $this = this;
-					$('[data-sw-translate]').each(function() {
-						$(this).html($this._tryTranslate($(this).html()));
-						$(this).val($this._tryTranslate($(this).val()));
-						$(this).attr('title', $this._tryTranslate($(this).attr('title')));
-					});
-				},
+                        })
+                        window.SwaggerTranslator = {
+                                _words: [],
+                                translate: function() {
+                                        var $this = this;
+                                        $('[data-sw-translate]').each(function() {
+                                                $(this).html($this._tryTranslate($(this).html()));
+                                                $(this).val($this._tryTranslate($(this).val()));
+                                                $(this).attr('title', $this._tryTranslate($(this).attr('title')));
+                                        });
+                                },
 
-				_tryTranslate: function(word) {
-					return this._words[$.trim(word)] !== undefined ? this._words[$.trim(word)] : word;
-				},
+                                _tryTranslate: function(word) {
+                                        return this._words[$.trim(word)] !== undefined ? this._words[$.trim(word)] : word;
+                                },
 
-				learn: function(wordsMap) {
-					this._words = wordsMap;
-				}
-			};
+                                learn: function(wordsMap) {
+                                        this._words = wordsMap;
+                                }
+                        };
 
-			window.SwaggerTranslator.learn({
-				"Please enter verification code - OneinStack WAF": "输入验证码 - OneinStack防火墙",
-				"Your query looks similar to an automated request from computer software. In order to protect our users, please forgive us for temporarily not processing your request.": "您的查询看起来类似于来自计算机软件的自动请求。为了保护我们的用户，请原谅我们现在暂时不能处理您的请求。",
-				"To continue accessing the webpage, please enter the characters shown below:": "要继续访问网页，请输入下面所示字符：",
-				"Sorry...": "很抱歉...",
-				"Submit": "提交",
-			});
+                        window.SwaggerTranslator.learn({
+                                "Please enter verification code - OneinStack WAF": "输入验证码 - OneinStack防火墙",
+                                "Your query looks similar to an automated request from computer software. In order to protect our users, please forgive us for temporarily not processing your request.": "您的查询看起来类似于来自计算机软件的自动请求。为了保护我们的用户，请原谅我们现在暂时不能处理您的请求。",
+                                "To continue accessing the webpage, please enter the characters shown below:": "要继续访问网页，请输入下面所示字符：",
+                                "Sorry...": "很抱歉...",
+                                "Submit": "提交",
+                        });
 
-			$(function() {
-				window.SwaggerTranslator.translate();
-			});
-		</script>
-	</body>
+                        $(function() {
+                                window.SwaggerTranslator.translate();
+                        });
+                </script>
+        </body>
 </html>
 ]]
 config_output_html=[[
@@ -143,7 +143,7 @@ config_output_html=[[
 <title>网站防火墙</title>
 <style>
 p {
-	line-height:20px;
+        line-height:20px;
 }
 ul{ list-style-type:none;}
 li{ list-style-type:none;}
@@ -166,6 +166,6 @@ li{ list-style-type:none;}
 </body></html>
 ]]
 
-config_weichat_qq_output_html=[[
+config_wechat_qq_output_html=[[
 <!DOCTYPE html><html lang="en"> <head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width, initial-scale=1.0"> <meta http-equiv="X-UA-Compatible" content="ie=edge" > <title>打开提示</title> <style> * { padding: 0; margin: 0; } body, html { height: 100%; background: #eee; } .alert { display: block; } .alert > .couvers { position: fixed; left: 0; right: 0; bottom: 0; top: 0; width: 100%; height: 100%; background: #000; filter: alpha(opacity=44); z-index: 1000; opacity: 0.44; } .alert > .body { position: fixed; left: 0; top: 0; right: 0; bottom: 0; z-index: 10000; color: #fff; } .tips-text { text-align: center; margin-top: 25%; } .tips-toward { position: fixed; right: 28px; top: 10px; } </style> </head> <body> <div class="alert"> <div class="couvers"></div> <div class="body"> <img class="tips-toward" src="data:image/png;base64,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" alt="" /> <div class="tips-text"> 微信QQ用户请在右上角选择"在浏览器打开" </div> </div> </div> </body></html>
 ]]
