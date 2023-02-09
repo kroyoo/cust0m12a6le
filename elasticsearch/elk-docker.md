@@ -1,6 +1,6 @@
 ### first start a container
 
-``` shell
+```shell
 docker run -d \
  --name elasticsearch \
  --restart always \
@@ -11,7 +11,7 @@ docker run -d \
 
 and then copy container file to host, and restart container
 
-``` shell
+```shell
 mkdir -p /docker-volume/es
 cd /docker-volume/es
 docker cp elasticsearch:/usr/share/elasticsearch ./
@@ -29,10 +29,9 @@ docker run -d \
 
 ```
 
+kibana also to
 
-kibana also to 
-
-``` shell
+```shell
 
 docker run -d \
  --name kibana \
@@ -52,4 +51,22 @@ docker run -d \
  -v /docker-volume/kibana:/usr/share/kibana \
  kibana:8.6.1
 
+```
+
+
+logstash
+
+```shell
+docker run -d \
+    --name logstash\
+    --net elastic \
+    --restart unless-stopped \
+    -p 127.0.0.1:5044:5044 \
+    -p 127.0.0.1:5000:5000/tcp \
+    -p 127.0.0.1:5000:5000/udp \
+    -p 127.0.0.1:9600 :9600 \
+    --privileged \
+    -v /docker-volume/logstash/config:/usr/share/logstash/config \
+    -v /docker-volume/logstash/data:/usr/share/logstash/data \
+    logstash:8.6.1
 ```
