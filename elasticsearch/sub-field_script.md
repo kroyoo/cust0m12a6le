@@ -1,9 +1,6 @@
 ## script
 
 ```kibana
-## script
-
-```kibana
 POST /test_index/_update_by_query
 {
   "script": {
@@ -51,7 +48,6 @@ POST /test_index/_update_by_query
   }
 }
 
-```
 
 POST /test_index/_update_by_query
 {
@@ -98,7 +94,4 @@ POST /test_index/_update_by_query
     }
   }
 }
-
-```
-
 ```
