@@ -31,13 +31,12 @@ https://rec.danmuji.org/dev/bilibili-cdn
 
 
 code
-```
+``` javascript
 // 去 P2P CDN
-if (location.href.startsWith('https://www.bilibili.com/video/') || location.href.startsWith('https://www.bilibili.com/bangumi/play/')) {
+if ( location.href.startsWith('https://www.bilibili.com/video/') || location.href.startsWith('https://www.bilibili.com/bangumi/play/') || location.href.startsWith('https://www.bilibili.com/blackboard/') ) {
     const cdnDomains = [
         "upos-sz-mirrorhw.bilivideo.com",
         "upos-sz-mirrorcos.bilivideo.com",
-        "upos-sz-mirrorbs.bilivideo.com",
         "upos-sz-mirrorali.bilivideo.com",
         "upos-sz-mirrorcoso1.bilivideo.com"
     ];
@@ -50,7 +49,10 @@ if (location.href.startsWith('https://www.bilibili.com/video/') || location.href
         try {
             const urlObj = new URL(url);
             const hostName = urlObj.hostname;
-            console.warn(hostName)
+            if ( url.includes('bilibili') || url.includes('hdslb') || url.includes('biliapi') ) {
+                return url;
+            }
+            // console.warn(hostName)
             urlObj.host = getRandomCdnDomain();
             urlObj.port = 443;
             console.warn(`更换视频源: ${hostName} -> ${urlObj.host}`);
@@ -62,7 +64,7 @@ if (location.href.startsWith('https://www.bilibili.com/video/') || location.href
 
     function replaceP2PUrlDeep(obj) {
         for (const key in obj) {
-            if (typeof obj[key] === 'string') {
+            if ( key === 'baseUrl' ) {
                 obj[key] = replaceP2PUrl(obj[key]);
             } else if (typeof obj[key] === 'array' || typeof obj[key] === 'object') {
                 replaceP2PUrlDeep(obj[key]);
