@@ -1,0 +1,69 @@
+{
+    "log": {
+        "access": "/var/log/xray/access.log",
+        "error": "/var/log/xray/error.log",
+        "loglevel": "warning"
+    },
+    "inbounds": [
+        {
+          "tag": "to-xx-server",
+          // ...
+        }
+    ],
+    "outbounds": [
+        {
+            "tag": "direct",
+            "protocol": "freedom",
+            "settings": {}
+        },
+        {
+            "tag": "blocked",
+            "protocol": "blackhole",
+            "settings": {}
+        },
+        {
+            "tag": "xx-server-ss-porxy",
+            "protocol": "shadowsocks",
+            "settings": {
+                "servers": [
+                  {
+                    "email": "love@xray.com",
+                    "address": "{{xx server ip}}",
+                    "port": 54321,
+                    "method": "2022-blake3-aes-128-gcm",
+                    "password": "dyQyx3g39/xqtdgA6JBSyA==:M+2DH15BUeO0a32+adQZPQ==",
+                    "uot": true,
+                    "UoTVersion": 2,
+                    "level": 0
+                  }
+                ]
+              }
+        }
+    ],
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {
+                "type": "field",
+                "inboundTag": [
+                    "to-xx-server"
+                ],
+                "outboundTag": "xx-server-ss-porxy"
+            },
+            {
+                "type": "field",
+                "ip": [
+                    "geoip:private"
+                ],
+                "outboundTag": "blocked"
+            },
+            {
+                "type": "field",
+                "outboundTag": "Reject",
+                "domain": [
+                    "geosite:category-ads-all"
+                ]
+            }
+        ]
+    }
+}
