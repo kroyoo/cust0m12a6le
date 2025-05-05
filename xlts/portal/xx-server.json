@@ -1,0 +1,58 @@
+{
+    "log": {
+        "access": "/var/log/xray/access.log",
+        "error": "/var/log/xray/error.log",
+        "loglevel": "warning"
+    },
+    "inbounds": [
+        {
+            "listen": "0.0.0.0",
+            "port": 54321,
+            "protocol": "shadowsocks",
+            "settings": {
+                "network": "tcp,udp",
+                "method": "2022-blake3-aes-128-gcm",
+                "password": "dyQyx3g39/xqtdgA6JBSyA==",
+                "level": 0,
+                "email": "love@xray.com",
+                "clients": [
+                    {
+                        "password": "M+2DH15BUeO0a32+adQZPQ==",
+                        "email": "love@xray.com"
+                    }
+                ]
+            }
+        }
+    ],
+    "outbounds": [
+        {
+            "tag": "direct",
+            "protocol": "freedom",
+            "settings": {}
+        },
+        {
+            "tag": "blocked",
+            "protocol": "blackhole",
+            "settings": {}
+        }
+    ],
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {
+                "type": "field",
+                "ip": [
+                    "geoip:private"
+                ],
+                "outboundTag": "blocked"
+            },
+            {
+                "type": "field",
+                "outboundTag": "blocked",
+                "domain": [
+                    "geosite:category-ads-all"
+                ]
+            }
+        ]
+    }
+}
