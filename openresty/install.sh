@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # OpenResty 编译安装脚本
-# 仅适用于 Debian/Ubuntu 系统
+# 适用于 Debian/Ubuntu 和 Red Hat 系列系统
 
 # 软件版本配置
 openresty_version=1.27.1.2
@@ -9,7 +9,7 @@ openssl_version=3.4.1
 pcre_version=10.44
 jemalloc_version=5.3.0
 libmaxminddb_version=1.12.2
-nginx_version=1.27.1
+nginx_version=1.27.1 # OpenResty 1.27.1.2 捆绑的 Nginx 版本
 
 # 颜色定义
 RED='\033[0;31m'
@@ -49,7 +49,7 @@ format_time() {
     local H=$((T/60/60%24))
     local M=$((T/60%60))
     local S=$((T%60))
-    
+
     [[ $D > 0 ]] && printf '%d天 ' $D
     [[ $H > 0 ]] && printf '%d小时 ' $H
     [[ $M > 0 ]] && printf '%d分 ' $M
@@ -85,15 +85,20 @@ cleanup() {
         rm -rf "$WORKDIR"
         log_info "工作目录已清理"
     fi
-    
+
     # 计算总运行时间
     END_TIME=$(date +%s)
     TOTAL_TIME=$((END_TIME - START_TIME))
-    OPENRESTY_TIME=$((OPENRESTY_END_TIME - OPENRESTY_START_TIME))
-    
+    if [ $OPENRESTY_START_TIME -ne 0 ] && [ $OPENRESTY_END_TIME -ne 0 ]; then
+        OPENRESTY_TIME=$((OPENRESTY_END_TIME - OPENRESTY_START_TIME))
+        echo "OpenResty 编译时间: $(format_time $OPENRESTY_TIME)"
+    fi
+
     echo "====================================================="
     echo -e "${GREEN}脚本执行统计:${NC}"
-    echo "OpenResty 编译时间: $(format_time $OPENRESTY_TIME)"
+    if [ $OPENRESTY_START_TIME -ne 0 ] && [ $OPENRESTY_END_TIME -ne 0 ]; then
+      echo "OpenResty 编译时间: $(format_time $OPENRESTY_TIME)"
+    fi
     echo "脚本总运行时间: $(format_time $TOTAL_TIME)"
     echo "====================================================="
 }
@@ -105,28 +110,37 @@ trap cleanup EXIT
 create_nginx_user() {
     log_info "创建 Nginx 用户和组..."
     if ! id -u www >/dev/null 2>&1; then
-        useradd -r -s /bin/false www
+        useradd -r -s /sbin/nologin www # 使用 /sbin/nologin 更常见
+    else
+        log_info "用户 www 已存在。"
+    fi
+    if ! getent group www >/dev/null 2>&1; then
+        groupadd -r www
+    else
+        log_info "用户组 www 已存在。"
     fi
 }
 
 # 将nginx添加到PATH
 add_nginx_to_path() {
     log_info "将 Nginx 添加到系统 PATH..."
-    
+
     # 创建软链接
-    if [ ! -e /usr/bin/nginx ]; then
+    if [ ! -L /usr/bin/nginx ] && [ ! -f /usr/bin/nginx ]; then # 检查是否不是软链接也不是文件
         ln -s /usr/local/openresty/nginx/sbin/nginx /usr/bin/nginx
         log_info "已创建 Nginx 软链接: /usr/bin/nginx"
+    elif [ -L /usr/bin/nginx ]; then
+        log_warn "Nginx 软链接 /usr/bin/nginx 已存在，跳过创建"
     else
-        log_warn "Nginx 软链接已存在，跳过创建"
+        log_warn "/usr/bin/nginx 已存在但不是预期的软链接，请检查。"
     fi
-    
+
     # 验证nginx是否可用
     if command_exists nginx; then
         log_info "Nginx 已成功添加到 PATH"
     else
         log_error "添加 Nginx 到 PATH 失败"
-        exit 1
+        # exit 1 # 考虑是否在此处强制退出
     fi
 }
 
@@ -134,85 +148,130 @@ add_nginx_to_path() {
 pre_check() {
     log_info "开始环境检查..."
     check_root
-    
+
     # 检测操作系统
     if [ -f /etc/os-release ]; then
         source /etc/os-release
-        case $ID in
-        debian|ubuntu)
+        # 优先使用 ID_LIKE 进行更广泛的兼容性判断 (例如 RHEL, CentOS, Fedora, Rocky, AlmaLinux)
+        # 如果 ID_LIKE 不存在或不匹配，则回退到 ID
+        if [[ "${ID_LIKE}" == *"debian"* || "${ID_LIKE}" == *"ubuntu"* || "${ID}" == "debian" || "${ID}" == "ubuntu" ]]; then
             OS_TYPE="debian"
-            log_info "检测到 $PRETTY_NAME 系统"
-            ;;
-        *)
-            log_error "不支持的操作系统，本脚本仅支持 Debian/Ubuntu 系统"
+            log_info "检测到 $PRETTY_NAME 系统 (Debian/Ubuntu like)"
+        elif [[ "${ID_LIKE}" == *"rhel"* || "${ID_LIKE}" == *"fedora"* || "${ID}" == "centos" || "${ID}" == "rhel" || "${ID}" == "fedora" || "${ID}" == "rocky" || "${ID}" == "almalinux" ]]; then
+            OS_TYPE="redhat"
+            log_info "检测到 $PRETTY_NAME 系统 (Red Hat like)"
+        else
+            log_error "不支持的操作系统: $PRETTY_NAME. 本脚本仅支持 Debian/Ubuntu 和 Red Hat 系列系统."
             exit 1
-            ;;
-        esac
+        fi
     else
-        log_error "无法检测操作系统类型"
+        log_error "无法检测操作系统类型 (未找到 /etc/os-release)"
         exit 1
     fi
-    
-    # 更新软件包列表
-    log_info "更新软件包列表..."
-    apt-get -y update
-    
-    # 自动移除不需要的包
-    log_info "自动移除不需要的包..."
-    apt-get -y autoremove
-    
-    # 修复依赖问题
-    log_info "修复依赖问题..."
-    apt-get -yf install
-    
-    # 升级现有软件包
-    log_info "升级现有软件包..."
-    apt-get -y upgrade
-    
-    # 安装编译依赖
-    log_info "安装编译依赖..."
-    pkgList="debian-keyring debian-archive-keyring build-essential gcc g++ make cmake autoconf libjpeg62-turbo-dev libjpeg-dev libpng-dev libgd-dev libxml2 libxml2-dev zlib1g zlib1g-dev libc6 libc6-dev libc-client2007e-dev libglib2.0-0 libglib2.0-dev bzip2 libzip-dev libbz2-1.0 libncurses5 libncurses5-dev libaio1 libaio-dev numactl libreadline-dev curl libcurl3-gnutls libcurl4-openssl-dev e2fsprogs libkrb5-3 libkrb5-dev libltdl-dev openssl net-tools libssl-dev libtool libevent-dev bison re2c libsasl2-dev libxslt1-dev libicu-dev locales patch vim zip unzip tmux htop bc dc expect libexpat1-dev libonig-dev libtirpc-dev git lsof lrzsz rsyslog cron logrotate chrony libsqlite3-dev psmisc wget sysv-rc apt-transport-https ca-certificates software-properties-common gnupg"
 
-    for Package in ${pkgList}; do
-        log_info "安装 $Package..."
-        apt-get --no-install-recommends -y install ${Package}
-    done
-    
+    if [ "$OS_TYPE" == "debian" ]; then
+        log_info "更新软件包列表 (Debian/Ubuntu)..."
+        apt-get -y update
+
+
+        log_info "尝试修复依赖问题 (Debian/Ubuntu)..."
+        apt-get -yf install # 尝试修复损坏的依赖
+
+        log_info "升级现有软件包 (Debian/Ubuntu)..."
+        # 使用非交互模式避免升级过程中的提示
+        DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade
+
+        log_info "安装编译依赖 (Debian/Ubuntu)..."
+        # 原始 pkgList 的精简和调整版本
+        pkgList="build-essential gcc g++ make cmake autoconf libjpeg-turbo-dev libpng-dev libgd-dev libxml2-dev zlib1g-dev libglib2.0-dev libzip-dev libbz2-dev libncurses5-dev libncursesw5-dev libaio-dev numactl libreadline-dev curl libcurl4-openssl-dev libssl-dev libtool libevent-dev bison re2c libsasl2-dev libxslt1-dev libicu-dev patch vim zip unzip tmux htop bc dc expect libexpat1-dev libonig-dev libtirpc-dev git lsof lrzsz rsyslog cron logrotate chrony libsqlite3-dev psmisc wget ca-certificates gnupg perl"
+        # 确保 perl 已安装，OpenSSL编译等过程需要
+
+        for Package in $pkgList; do
+            log_info "安装 (Debian/Ubuntu) $Package..."
+            DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends -y install "$Package"
+        done
+
+    elif [ "$OS_TYPE" == "redhat" ]; then
+        PKG_MANAGER=""
+        if command_exists dnf; then
+            PKG_MANAGER="dnf"
+            log_info "使用 dnf 包管理器。"
+        elif command_exists yum; then
+            PKG_MANAGER="yum"
+            log_info "使用 yum 包管理器。"
+        else
+            log_error "未找到 yum 或 dnf 包管理器。"
+            exit 1
+        fi
+
+        log_info "升级现有软件包 (Red Hat like)..."
+        $PKG_MANAGER -y upgrade
+
+        log_info "安装 EPEL repository (Red Hat like)..."
+        # EPEL源提供了许多额外的常用软件包
+        $PKG_MANAGER -y install epel-release
+
+        log_info "安装 'Development Tools' 开发工具组 (Red Hat like)..."
+        $PKG_MANAGER -y groupinstall "Development Tools"
+        log_info "启用 CRB (CodeReady Builder) / PowerTools 仓库 (Red Hat like)..."
+        # 对于 RHEL 9 及其衍生版 (Alma, Rocky, CentOS Stream 9+)
+        if dnf repolist all | grep -q -E 'crb|codeready-builder'; then
+            dnf config-manager --set-enabled $(sudo dnf repolist all | grep -E 'crb|codeready-builder' | awk '{print $1}' | cut -d'/' -f1 | head -n1)
+        elif  dnf repolist all | grep -q 'powertools'; then
+            dnf config-manager --set-enabled powertools
+        else
+            log_warn "未能自动识别并启用 CRB/PowerTools 仓库。某些开发包可能无法找到。"
+        fi
+        # 刷新元数据可能有助于立即识别新启用的仓库中的包
+        dnf makecache --timer
+        log_info "安装编译依赖 (Red Hat like)..."
+        # Red Hat 系列的软件包列表
+        rhPkgList="gcc gcc-c++ make cmake autoconf libtool bison re2c perl libjpeg-turbo-devel libpng-devel gd-devel libxml2-devel zlib-devel glibc-devel glib2-devel libzip-devel bzip2-devel ncurses-devel libaio-devel numactl-devel readline-devel libcurl-devel openssl-devel krb5-devel libtool-ltdl-devel libevent-devel cyrus-sasl-devel libxslt-devel libicu-devel expat-devel oniguruma-devel libtirpc-devel sqlite-devel patch vim-enhanced zip unzip tmux htop bc expect git lsof lrzsz rsyslog cronie logrotate chrony psmisc wget ca-certificates gnupg2 glibc-common e2fsprogs net-tools"
+
+        for Package in $rhPkgList; do
+            log_info "安装 (Red Hat like) $Package..."
+            $PKG_MANAGER -y install "$Package"
+        done
+
+
+        log_info "清理 $PKG_MANAGER 缓存 (Red Hat like)..."
+        $PKG_MANAGER clean all
+    fi
+
     log_info "环境检查完成"
-    clear
 }
 
 # 下载源码
 download() {
     log_info "开始下载源码..."
-    
+
     # 创建源码目录
     mkdir -p src
     cd src || exit 1
-    
+
     # 下载第三方模块
     log_info "下载 ngx_http_geoip2_module..."
     git clone https://github.com/leev/ngx_http_geoip2_module
-    
+
     log_info "下载 ngx_http_substitutions_filter_module..."
     git clone https://github.com/yaoweibin/ngx_http_substitutions_filter_module
-    
+
     # 下载依赖库
     log_info "下载 PCRE2 $pcre_version..."
     wget -q -O pcre2-${pcre_version}.tar.gz https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${pcre_version}/pcre2-${pcre_version}.tar.gz
-    
+
     log_info "下载 libmaxminddb $libmaxminddb_version..."
     wget -q -O libmaxminddb-${libmaxminddb_version}.tar.gz https://github.com/maxmind/libmaxminddb/releases/download/${libmaxminddb_version}/libmaxminddb-${libmaxminddb_version}.tar.gz
-    
+
     log_info "下载 jemalloc $jemalloc_version..."
     wget -q -O jemalloc-${jemalloc_version}.tar.bz2 https://github.com/jemalloc/jemalloc/releases/download/${jemalloc_version}/jemalloc-${jemalloc_version}.tar.bz2
-    
+
     log_info "下载 OpenSSL $openssl_version..."
     wget -q -O openssl-${openssl_version}.tar.gz https://github.com/openssl/openssl/releases/download/openssl-${openssl_version}/openssl-${openssl_version}.tar.gz
-    
+
     log_info "下载 OpenResty $openresty_version..."
     wget -q -O openresty-${openresty_version}.tar.gz https://openresty.org/download/openresty-${openresty_version}.tar.gz
-    
+
     log_info "源码下载完成"
     cd ..
 }
@@ -221,17 +280,17 @@ download() {
 pre_install() {
     log_info "开始安装依赖库..."
     cd src || exit 1
-    
+
     # 解压源码包
     log_info "解压 PCRE2..."
     tar xzf pcre2-${pcre_version}.tar.gz
-    
+
     log_info "解压 OpenResty..."
     tar xzf openresty-${openresty_version}.tar.gz
-    
+
     log_info "解压 OpenSSL..."
     tar xzf openssl-${openssl_version}.tar.gz
-    
+
     # 安装 jemalloc
     log_info "安装 jemalloc..."
     tar xjf jemalloc-${jemalloc_version}.tar.bz2
@@ -239,15 +298,22 @@ pre_install() {
     ./configure
     make -j "$(nproc)"
     make install
-    ln -s /usr/local/lib/libjemalloc.so.2 /usr/lib/libjemalloc.so.1
-    
+    # 检查是否存在 /usr/lib (在某些系统上可能是 /usr/lib64)
+    # 更稳健的做法是让 ldconfig 处理，或者确保 /usr/local/lib 在 ld.so.conf.d/ 中
+    if [ -d "/usr/lib64" ] && [ ! -e "/usr/lib64/libjemalloc.so.1" ]; then
+        ln -s /usr/local/lib/libjemalloc.so.2 /usr/lib64/libjemalloc.so.1
+    elif [ ! -e "/usr/lib/libjemalloc.so.1" ]; then
+        ln -s /usr/local/lib/libjemalloc.so.2 /usr/lib/libjemalloc.so.1
+    fi
+
+
     # 添加动态库路径
-    if [ -z "$(grep /usr/local/lib /etc/ld.so.conf.d/*.conf)" ]; then
-        echo '/usr/local/lib' > /etc/ld.so.conf.d/local.conf
+    if ! grep -q "/usr/local/lib" /etc/ld.so.conf.d/*.conf /etc/ld.so.conf 2>/dev/null ; then
+        echo '/usr/local/lib' > /etc/ld.so.conf.d/usr-local-lib.conf
     fi
     ldconfig
     cd ..
-    
+
     # 安装 libmaxminddb
     log_info "安装 libmaxminddb..."
     tar xzf libmaxminddb-${libmaxminddb_version}.tar.gz
@@ -257,7 +323,7 @@ pre_install() {
     make install
     ldconfig
     cd ..
-    
+
     log_info "依赖库安装完成"
     cd ..
 }
@@ -266,16 +332,22 @@ pre_install() {
 rename_ngx() {
     log_info "开始修改 Nginx 标识..."
     cd src/openresty-${openresty_version} || exit 1
-    
+
     # 修改 Nginx 版本信息
-    sed -i 's/"openresty\/.*"/"Fungit"/' bundle/nginx-${nginx_version}/src/core/nginx.h
-    sed -i 's/#define NGINX_VAR          "NGINX"/#define NGINX_VAR          "Fungit"/' bundle/nginx-${nginx_version}/src/core/nginx.h
-    sed -i 's/#define NGINX_VER_BUILD    NGINX_VER " (" NGX_BUILD ")"/#define NGINX_VER_BUILD    NGINX_VER/' bundle/nginx-${nginx_version}/src/core/nginx.h
-    sed -i 's/"Server: openresty"/"Server: Fungit"/' bundle/nginx-${nginx_version}/src/http/ngx_http_header_filter_module.c
-    sed -i 's/"<hr><center>openresty<\/center>"/"<hr><center>Fungit<\/center>"/'  bundle/nginx-${nginx_version}/src/http/ngx_http_special_response.c
-    sed -i 's/"server: nginx/"server: Fungit/' bundle/nginx-${nginx_version}/src/http/v2/ngx_http_v2_filter_module.c
-    sed -i 's/"openresty"/"Fungit"/' bundle/nginx-${nginx_version}/src/http/v3/ngx_http_v3_filter_module.c
-    
+    sed -i 's/"openresty\/.*"/"Fungit"/' "bundle/nginx-${nginx_version}/src/core/nginx.h"
+    sed -i 's/#define NGINX_VAR          "NGINX"/#define NGINX_VAR          "Fungit"/' "bundle/nginx-${nginx_version}/src/core/nginx.h"
+    sed -i 's/#define NGINX_VER_BUILD    NGINX_VER " (" NGX_BUILD ")"/#define NGINX_VER_BUILD    NGINX_VER/' "bundle/nginx-${nginx_version}/src/core/nginx.h"
+    sed -i 's/"Server: openresty"/"Server: Fungit"/' "bundle/nginx-${nginx_version}/src/http/ngx_http_header_filter_module.c"
+    sed -i 's/"<hr><center>openresty<\/center>"/"<hr><center>Fungit<\/center>"/'  "bundle/nginx-${nginx_version}/src/http/ngx_http_special_response.c"
+    sed -i 's/"server: nginx"/"server: Fungit/' "bundle/nginx-${nginx_version}/src/http/v2/ngx_http_v2_filter_module.c"
+    local http3_filter_module_path="bundle/nginx-${nginx_version}/src/http/v3/ngx_http_v3_filter_module.c"
+    if [ -f "$http3_filter_module_path" ]; then
+        sed -i 's/"openresty"/"Fungit"/' "$http3_filter_module_path"
+    else
+        log_warn "HTTP/3 filter module ($http3_filter_module_path) not found, skipping rename for it."
+    fi
+
+
     log_info "Nginx 标识修改完成"
     cd ../..
 }
@@ -283,175 +355,235 @@ rename_ngx() {
 # 配置Nginx
 configure_nginx() {
     log_info "开始配置 Nginx..."
-    
+
     # 创建日志目录
     LOG_DIR="/data/wwwlogs"
     mkdir -p "$LOG_DIR"
-    chown www:www "$LOG_DIR"
+    chown www:www "$LOG_DIR" # 确保 www 用户和组已创建
     chmod 755 "$LOG_DIR"
-    
+
     # 创建 PID 文件目录
     PID_DIR="/var/run/nginx"
     mkdir -p "$PID_DIR"
     chown www:www "$PID_DIR"
     chmod 755 "$PID_DIR"
-    
+
     # 修改 nginx.conf 配置文件
-    NGINX_CONF="/usr/local/openresty/nginx/conf/nginx.conf"
-    
-    # 备份原始配置
-    cp "$NGINX_CONF" "${NGINX_CONF}.bak"
-    
-    # 在 main 上下文中添加 pid 指令
-    if ! grep -q "pid /var/run/nginx/nginx.pid;" "$NGINX_CONF"; then
-        # 在第一行添加 pid 指令
-        sed -i '1s/^/pid \/var\/run\/nginx\/nginx.pid;\n/' "$NGINX_CONF"
+    NGINX_CONF_DIR="/usr/local/openresty/nginx/conf"
+    NGINX_CONF="${NGINX_CONF_DIR}/nginx.conf"
+
+    if [ ! -f "$NGINX_CONF" ]; then
+        log_error "Nginx 配置文件 $NGINX_CONF 未找到。可能安装未成功。"
+        exit 1
     fi
-    
+
+    # 备份原始配置
+    cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+
+    # 确保 pid 指令在 main 上下文的顶层
+    if ! grep -q "pid ${PID_DIR}/nginx.pid;" "$NGINX_CONF"; then
+        sed -i "1s|^|pid ${PID_DIR}/nginx.pid;\\n|" "$NGINX_CONF"
+        log_info "已添加 pid 指令到 $NGINX_CONF"
+    fi
+
     # 配置 worker_processes 为 CPU 核心数
     sed -i "s/worker_processes  1/worker_processes  $(nproc)/" "$NGINX_CONF"
-    
+
     # 配置错误日志
     sed -i "s|error_log  logs/error.log|error_log  ${LOG_DIR}/error.log|" "$NGINX_CONF"
-    
-    # 配置访问日志
+
     sed -i "s|access_log  logs/access.log|access_log  ${LOG_DIR}/access.log|" "$NGINX_CONF"
-    
-    # 设置 user 为 www
-    sed -i "s|#user  nobody|user  www www|" "$NGINX_CONF"
-    
+
+    # 设置 user 为 www (确保是在 main 上下文)
+    if grep -q "^user " "$NGINX_CONF"; then
+      sed -i "s|^user .*|user  www www;|" "$NGINX_CONF"
+    elif grep -q "^#user " "$NGINX_CONF"; then # 如果是被注释掉的
+      sed -i "s|^#user .*|user  www www;|" "$NGINX_CONF"
+    else # 如果完全没有 user 指令，添加到 pid 之后
+      sed -i "/pid ${PID_DIR}\/nginx.pid;/a user  www www;" "$NGINX_CONF"
+    fi
+
+
     log_info "Nginx 配置完成"
 }
 
 # 设置Nginx服务
 setup_nginx_service() {
     log_info "开始设置 Nginx 服务..."
-    
+
     # 创建 systemd 服务文件
     log_info "创建 systemd 服务文件..."
-    cat > /lib/systemd/system/nginx.service << EOF
+    SYSTEMD_SERVICE_DIR="/etc/systemd/system"
+    if [ ! -d "$SYSTEMD_SERVICE_DIR" ] && [ -d "/usr/lib/systemd/system" ]; then
+        SYSTEMD_SERVICE_DIR="/usr/lib/systemd/system"
+    elif [ ! -d "$SYSTEMD_SERVICE_DIR" ] && [ -d "/lib/systemd/system" ]; then
+        SYSTEMD_SERVICE_DIR="/lib/systemd/system" # 作为最后的备选
+    fi
+    
+    mkdir -p "$SYSTEMD_SERVICE_DIR" # 确保目录存在
+
+    cat > "${SYSTEMD_SERVICE_DIR}/nginx.service" << EOF
 [Unit]
-Description=Fungit - 高性能 Web 服务器
-Documentation=http://nginx.org/en/docs/
-After=network.target
+Description=Fungit - High performance web server built on OpenResty
+Documentation=https://openresty.org/en/
+After=network.target network-online.target nss-lookup.target
+Wants=network-online.target
 
 [Service]
 Type=forking
 PIDFile=/var/run/nginx/nginx.pid
-ExecStartPost=/bin/sleep 0.1
-ExecStartPre=/usr/local/openresty/nginx/sbin/nginx -t -c /usr/local/openresty/nginx/conf/nginx.conf
-ExecStart=/usr/local/openresty/nginx/sbin/nginx -c /usr/local/openresty/nginx/conf/nginx.conf
-ExecReload=/bin/kill -s HUP $MAINPID
-ExecStop=/bin/kill -s QUIT $MAINPID
-TimeoutStartSec=120
+ExecStartPre=/usr/local/openresty/nginx/sbin/nginx -t -q -g 'daemon on; master_process on;' -c /usr/local/openresty/nginx/conf/nginx.conf
+ExecStart=/usr/local/openresty/nginx/sbin/nginx -g 'daemon on; master_process on;' -c /usr/local/openresty/nginx/conf/nginx.conf
+ExecReload=/usr/local/openresty/nginx/sbin/nginx -s reload
+ExecStop=/bin/kill -s QUIT \$MAINPID
+TimeoutStopSec=5
+KillMode=mixed
+PrivateTmp=true
 LimitNOFILE=1000000
 LimitNPROC=1000000
-LimitCORE=1000000
+LimitCORE=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    
+
     # 重载 systemd 并启动 Nginx
-    log_info "启动 Nginx 服务..."
+    log_info "重载 systemd 并启用/启动 Nginx 服务..."
     systemctl daemon-reload
     systemctl enable nginx
-    
+
     # 检查配置文件是否正确
     log_info "检查 Nginx 配置文件..."
-    if /usr/local/openresty/nginx/sbin/nginx -t -c /usr/local/openresty/nginx/conf/nginx.conf; then
-        systemctl start nginx
-        
+    if /usr/local/openresty/nginx/sbin/nginx -t -q -c /usr/local/openresty/nginx/conf/nginx.conf; then
+        log_info "Nginx 配置文件测试通过。"
+        if systemctl is-active --quiet nginx; then
+            log_info "Nginx 服务已在运行，尝试重启..."
+            systemctl restart nginx
+        else
+            log_info "启动 Nginx 服务..."
+            systemctl start nginx
+        fi
+
         # 检查服务状态
         if systemctl is-active --quiet nginx; then
-            log_info "Nginx 服务已成功启动"
+            log_info "Nginx 服务已成功启动/重启"
         else
-            log_error "Nginx 服务启动失败"
-            systemctl status nginx --no-pager
+            log_error "Nginx 服务启动/重启失败"
+            systemctl status nginx --no-pager || true # 显示状态，即使失败
+            journalctl -u nginx --no-pager -n 50 || true # 显示最新的50条日志
         fi
     else
-        log_error "Nginx 配置文件有错误，无法启动服务"
+        log_error "Nginx 配置文件有错误，无法启动服务。请手动检查。"
+        /usr/local/openresty/nginx/sbin/nginx -t -c /usr/local/openresty/nginx/conf/nginx.conf || true
         exit 1
     fi
-    
+
     log_info "Nginx 服务设置完成"
 }
 
 # 安装 OpenResty
-install() {
+install_openresty() { 
     log_info "开始安装 OpenResty..."
-    
+
     # 记录开始时间
     OPENRESTY_START_TIME=$(date +%s)
-    
+
     cd src/openresty-${openresty_version} || exit 1
-    
+
     # 配置编译选项
     log_info "配置编译选项..."
     ./configure \
         --prefix=/usr/local/openresty \
-        --with-cc-opt=-O2 \
+        --with-cc-opt="-O2" \
+        --with-ld-opt="-Wl,-rpath,/usr/local/lib -ljemalloc" \
         --user=www \
         --group=www \
-        --with-http_stub_status_module \
-        --with-http_sub_module \
-        --with-http_v2_module \
+        --with-compat \
+        --with-file-aio \
+        --with-threads \
         --with-http_ssl_module \
-        --with-http_gzip_static_module \
-        --with-http_gunzip_module \
+        --with-http_v2_module \
+        --with-http_v3_module \
         --with-http_realip_module \
+        --with-http_addition_module \
+        --with-http_xslt_module=dynamic \
+        --with-http_image_filter_module=dynamic \
+        --with-http_sub_module \
+        --with-http_dav_module \
         --with-http_flv_module \
         --with-http_mp4_module \
-        --with-openssl=../openssl-${openssl_version} \
+        --with-http_gunzip_module \
+        --with-http_gzip_static_module \
+        --with-http_auth_request_module \
+        --with-http_random_index_module \
+        --with-http_secure_link_module \
+        --with-http_degradation_module \
+        --with-http_slice_module \
+        --with-http_stub_status_module \
+        --with-stream \
+        --with-stream_ssl_module \
+        --with-stream_realip_module \
+        --with-stream_ssl_preread_module \
         --with-pcre=../pcre2-${pcre_version} \
         --with-pcre-jit \
-        --with-ld-opt='-ljemalloc' \
+        --with-openssl=../openssl-${openssl_version} \
+        --with-openssl-opt="enable-ec_nistp_64_gcc_128 no-nextprotoneg" \
         --add-module=../ngx_http_geoip2_module \
-        --add-module=../ngx_http_substitutions_filter_module \
-        --with-stream_ssl_module \
-        --with-stream_ssl_preread_module \
-        --with-openssl-opt=-g \
-        --with-pcre-opt=-g \
-        --with-stream
-    
+        --add-module=../ngx_http_substitutions_filter_module
+
     # 编译和安装
     log_info "开始编译 (这可能需要一段时间)..."
     make -j "$(nproc)"
     log_info "开始安装..."
     make install
-    clear
-    
+    # clear # 编译安装后清理屏幕
+
     # 记录结束时间
     OPENRESTY_END_TIME=$(date +%s)
-    OPENRESTY_TIME=$((OPENRESTY_END_TIME - OPENRESTY_START_TIME))
-    
-    log_info "OpenResty 安装完成，耗时: $(format_time $OPENRESTY_TIME)"
+    # OPENRESTY_TIME 计算移到 cleanup 函数或 show_info
+
+    log_info "OpenResty 安装完成!" # 耗时信息移到 cleanup
     cd ../..
 }
 
 # 显示安装信息
 show_info() {
+    # 计算 OpenResty 编译时间，以防脚本在编译后但在 cleanup 前退出
+    if [ $OPENRESTY_START_TIME -ne 0 ] && [ $OPENRESTY_END_TIME -ne 0 ]; then
+        local current_openresty_time=$((OPENRESTY_END_TIME - OPENRESTY_START_TIME))
+        log_info "OpenResty 编译耗时: $(format_time "$current_openresty_time")"
+    fi
+
     echo "====================================================="
     echo -e "${GREEN}OpenResty 安装成功!${NC}"
     echo "版本信息:"
     echo "  - OpenResty: $openresty_version"
-    echo "  - Nginx: $nginx_version"
-    echo "  - OpenSSL: $openssl_version"
-    echo "  - PCRE2: $pcre_version"
+    echo "  - Nginx (core): $nginx_version" # OpenResty 捆绑的 Nginx 内核版本
+    echo "  - OpenSSL (used for build): $openssl_version"
+    echo "  - PCRE2 (used for build): $pcre_version"
     echo "  - jemalloc: $jemalloc_version"
     echo "  - libmaxminddb: $libmaxminddb_version"
     echo ""
     echo "安装位置: /usr/local/openresty"
-    echo "配置文件: /usr/local/openresty/nginx/conf/nginx.conf"
+    echo "Nginx 可执行文件: /usr/local/openresty/nginx/sbin/nginx"
+    echo "Nginx 配置文件: /usr/local/openresty/nginx/conf/nginx.conf"
     echo "日志目录: /data/wwwlogs"
     echo "PID 文件: /var/run/nginx/nginx.pid"
-    echo "服务管理:"
+    echo ""
+    echo "服务管理 (使用 systemd):"
     echo "  - 启动: systemctl start nginx"
     echo "  - 停止: systemctl stop nginx"
     echo "  - 重启: systemctl restart nginx"
     echo "  - 状态: systemctl status nginx"
+    echo "  - 开机启动: systemctl enable nginx"
+    echo "  - 禁止开机启动: systemctl disable nginx"
     echo ""
-    echo "Nginx 已添加到系统 PATH，可以直接使用 'nginx' 命令"
+    if command_exists nginx; then
+        echo "Nginx 已通过 /usr/bin/nginx 添加到系统 PATH。"
+        echo "Nginx 版本: $(nginx -V 2>&1 | grep "nginx version")"
+    else
+        echo "Nginx 未能成功链接到 /usr/bin/nginx。"
+    fi
     echo "====================================================="
 }
 
@@ -459,17 +591,22 @@ show_info() {
 main() {
     # 记录脚本开始时间
     START_TIME=$(date +%s)
-    
+
     log_info "开始 OpenResty 安装脚本..."
     pre_check
     create_nginx_user  # 在需要用户的操作前先创建用户
     download
     pre_install
     rename_ngx
-    install
-    configure_nginx
-    setup_nginx_service
-    add_nginx_to_path  # 添加nginx到PATH
+    install_openresty 
+    if [ -f "/usr/local/openresty/nginx/sbin/nginx" ]; then
+        configure_nginx
+        setup_nginx_service
+        add_nginx_to_path  # 添加nginx到PATH
+    else
+        log_error "OpenResty 安装似乎未成功，Nginx 可执行文件未找到。跳过配置和服务设置。"
+        exit 1
+    fi
     show_info
     log_info "脚本执行完成!"
 }
