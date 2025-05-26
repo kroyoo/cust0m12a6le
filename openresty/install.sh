@@ -489,7 +489,7 @@ Wants=network-online.target
 [Service]
 Type=forking
 PIDFile=/var/run/nginx/nginx.pid
-ExecStartPre=/usr/local/openresty/nginx/sbin/nginx -t -q 'daemon on; master_process on;' -c /usr/local/openresty/nginx/conf/nginx.conf
+ExecStartPre=/usr/local/openresty/nginx/sbin/nginx -t -q -c /usr/local/openresty/nginx/conf/nginx.conf
 ExecStart=/usr/local/openresty/nginx/sbin/nginx -g 'daemon on; master_process on;' -c /usr/local/openresty/nginx/conf/nginx.conf
 ExecStartPost=/bin/sleep 0.1
 ExecReload=/usr/local/openresty/nginx/sbin/nginx -s reload
