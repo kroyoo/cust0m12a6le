@@ -379,11 +379,36 @@ configure_nginx() {
 
     # 备份原始配置
     cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+# 配置 PID 文件路径
+    local target_pid_directive="pid ${PID_DIR}/nginx.pid;"
+    log_info "目标 PID 配置: ${target_pid_directive}"
 
-    # 确保 pid 指令在 main 上下文的顶层
-    if ! grep -q "pid ${PID_DIR}/nginx.pid;" "$NGINX_CONF"; then
-        sed -i "1s|^|pid ${PID_DIR}/nginx.pid;\\n|" "$NGINX_CONF"
-        log_info "已添加 pid 指令到 $NGINX_CONF"
+    # 检查 nginx.conf 中是否已存在任何 pid 指令 (以 'pid ' 开头，忽略注释)
+    if grep -q -E "^\s*pid\s+.*;" "$NGINX_CONF"; then
+        # 如果已存在 pid 指令，检查它是否已经是我们想要的配置
+        if grep -q -E "^\s*${target_pid_directive}\s*$" "$NGINX_CONF"; then
+            log_info "PID 指令已正确配置为: ${target_pid_directive}"
+        else
+            log_info "检测到已存在的 PID 指令，将尝试修改它..."
+            # 使用 sed 修改已存在的 pid 指令为目标配置
+            # 这个 sed 命令会替换第一个非注释的以 "pid " 开头的行
+            # 注意：如果配置文件中有多个 pid 指令（非注释），这只会修改第一个匹配到的
+            sudo sed -i -E "0,/\s*pid\s+.*;/s#^\s*pid\s+.*;#${target_pid_directive}#" "$NGINX_CONF"
+            log_info "已将现有 PID 指令修改为: ${target_pid_directive}"
+        fi
+    else
+        # 如果不存在任何 pid 指令，则在第一行非空非注释行前添加
+        log_info "未检测到 PID 指令，将添加新的 PID 指令..."
+        # 使用 awk 在 main context (通常是'events {'之前或文件顶部) 添加
+        # 这是一个更安全的做法，尝试添加到 user 指令之后（如果存在）或 events {} 块之前
+        if grep -q -E "^\s*user\s+.*;" "$NGINX_CONF"; then
+            sudo sed -i -E "/^\s*user\s+.*;/a ${target_pid_directive}" "$NGINX_CONF"
+        elif grep -q -E "^\s*events\s*\{" "$NGINX_CONF"; then # 尝试添加到 events 块之前
+            sudo sed -i -E "/^\s*events\s*\{/i ${target_pid_directive}" "$NGINX_CONF"
+        else # 作为后备，添加到文件顶部（去除旧的简单插入逻辑）
+            sudo sed -i "1s|^|${target_pid_directive}\\n|" "$NGINX_CONF"
+        fi
+        log_info "已添加 PID 指令: ${target_pid_directive}"
     fi
 
     # 配置 worker_processes 为 CPU 核心数
@@ -432,8 +457,9 @@ Wants=network-online.target
 [Service]
 Type=forking
 PIDFile=/var/run/nginx/nginx.pid
-ExecStartPre=/usr/local/openresty/nginx/sbin/nginx -t -q -g 'daemon on; master_process on;' -c /usr/local/openresty/nginx/conf/nginx.conf
+ExecStartPre=/usr/local/openresty/nginx/sbin/nginx -t -q 'daemon on; master_process on;' -c /usr/local/openresty/nginx/conf/nginx.conf
 ExecStart=/usr/local/openresty/nginx/sbin/nginx -g 'daemon on; master_process on;' -c /usr/local/openresty/nginx/conf/nginx.conf
+ExecStartPost=/bin/sleep 0.1
 ExecReload=/usr/local/openresty/nginx/sbin/nginx -s reload
 ExecStop=/bin/kill -s QUIT \$MAINPID
 TimeoutStopSec=5
