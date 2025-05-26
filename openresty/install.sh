@@ -11,6 +11,11 @@ jemalloc_version=5.3.0
 libmaxminddb_version=1.12.2
 nginx_version=1.27.1 # OpenResty 1.27.1.2 捆绑的 Nginx 版本
 
+
+default_brand_name="Fungit" # 脚本预设的替换后品牌名称
+target_brand_name=""       # 最终用于替换的品牌名称
+is_rename=0
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -328,24 +333,51 @@ pre_install() {
     cd ..
 }
 
+check_rename(){
+    log_info "服务器标识自定义步骤："
+    read -r -p "是否要修改 Nginx/OpenResty 的默认服务器标识 (例如, 将 'nginx' 或 'openresty' 修改为其他名称)? (y/N): " confirm_rename
+    local confirm_rename_lower
+    confirm_rename_lower=$(echo "$confirm_rename" | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$confirm_rename_lower" == "y" || "$confirm_rename_lower" == "yes" ]]; then
+        is_rename=1
+        read -r -p "请输入新的服务器标识 (直接回车将使用默认值 '${default_brand_name}'): " user_brand_name
+        if [ -z "$user_brand_name" ]; then # 如果用户未输入，则使用默认品牌名称
+            target_brand_name="$default_brand_name"
+        else
+            target_brand_name="$user_brand_name"
+        fi
+        log_info "服务器标识将被修改为: '${target_brand_name}'"
+    else
+        log_info "跳过修改服务器标识。将保留原始的 Nginx/OpenResty 标识。"
+    fi
+}
+
+
 # 重命名 Nginx 标识
 rename_ngx() {
+    if [[ "$is_rename" == "0" ]]; then
+        return
+    fi
+
     log_info "开始修改 Nginx 标识..."
     cd src/openresty-${openresty_version} || exit 1
 
+
     # 修改 Nginx 版本信息
-    sed -i 's/"openresty\/.*"/"Fungit"/' "bundle/nginx-${nginx_version}/src/core/nginx.h"
-    sed -i 's/#define NGINX_VAR          "NGINX"/#define NGINX_VAR          "Fungit"/' "bundle/nginx-${nginx_version}/src/core/nginx.h"
-    sed -i 's/#define NGINX_VER_BUILD    NGINX_VER " (" NGX_BUILD ")"/#define NGINX_VER_BUILD    NGINX_VER/' "bundle/nginx-${nginx_version}/src/core/nginx.h"
-    sed -i 's/"Server: openresty"/"Server: Fungit"/' "bundle/nginx-${nginx_version}/src/http/ngx_http_header_filter_module.c"
-    sed -i 's/"<hr><center>openresty<\/center>"/"<hr><center>Fungit<\/center>"/'  "bundle/nginx-${nginx_version}/src/http/ngx_http_special_response.c"
-    sed -i 's/"server: nginx"/"server: Fungit/' "bundle/nginx-${nginx_version}/src/http/v2/ngx_http_v2_filter_module.c"
+    sed -i "s|\"openresty\/.*\"|\"${target_brand_name}\"|" "bundle/nginx-${nginx_version}/src/core/nginx.h"
+    sed -i "s|#define NGINX_VAR          \"NGINX\"|#define NGINX_VAR          \"${target_brand_name}\"|" "bundle/nginx-${nginx_version}/src/core/nginx.h"
+    sed -i "s|#define NGINX_VER_BUILD    NGINX_VER \" (\" NGX_BUILD \")\"|#define NGINX_VER_BUILD    NGINX_VER|" "bundle/nginx-${nginx_version}/src/core/nginx.h"
+    sed -i "s|\"Server: openresty\"|\"Server: ${target_brand_name}\"|" "bundle/nginx-${nginx_version}/src/http/ngx_http_header_filter_module.c"
+    sed -i "s|\"<hr><center>openresty<\/center>\"|\"<hr><center>${target_brand_name}<\/center>\"|"  "bundle/nginx-${nginx_version}/src/http/ngx_http_special_response.c"
+    sed -i "s|server: nginx|server: ${target_brand_name}|" "bundle/nginx-${nginx_version}/src/http/v2/ngx_http_v2_filter_module.c"
     local http3_filter_module_path="bundle/nginx-${nginx_version}/src/http/v3/ngx_http_v3_filter_module.c"
     if [ -f "$http3_filter_module_path" ]; then
-        sed -i 's/"openresty"/"Fungit"/' "$http3_filter_module_path"
+        sed -i "s|\"openresty\"|\"${target_brand_name}\"|" "$http3_filter_module_path"
     else
         log_warn "HTTP/3 filter module ($http3_filter_module_path) not found, skipping rename for it."
     fi
+
 
 
     log_info "Nginx 标识修改完成"
@@ -619,6 +651,7 @@ main() {
     START_TIME=$(date +%s)
 
     log_info "开始 OpenResty 安装脚本..."
+    check_rename
     pre_check
     create_nginx_user  # 在需要用户的操作前先创建用户
     download
