@@ -1,0 +1,11 @@
+\.\./
+\$\{
+(?:union(?:\s+all)?\s+select)
+(?:select\s+.+\s+from)
+(?:sleep\(\s*\d+\s*\)|benchmark\(\s*\d+\s*,)
+(?:information_schema|load_file\s*\(|into\s+(?:dump|out)file)
+(?:\b(?:eval|assert|base64_decode|phpinfo|system|passthru|shell_exec)\s*\()
+(?:gopher|php|glob|file|phar|zlib|ftp|ldap|dict|data):/
+<(?:iframe|script|img|svg|body|meta|style|object|input)
+(?:onerror|onload|onmouseover)\s*=
+java\.lang

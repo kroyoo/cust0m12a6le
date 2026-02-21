@@ -1,1 +1,5 @@
-(HTTrack|harvest|audit|dirbuster|pangolin|nmap|sqln|-scan|hydra|Parser|libwww|BBBike|sqlmap|w3af|owasp|Nikto|fimap|havij|PycURL|zmeu|BabyKrokodil|netsparker|httperf|bench)
+# common scanners and attack tools
+(?:HTTrack|dirbuster|sqlmap|w3af|nikto|fimap|havij|netsparker|masscan|acunetix|zgrab2?|zmeu|pangolin|nmap|whatweb|jaeles|wpscan|gobuster|ffuf|amass)
+
+# internet-wide scanners / cyber asset mapping fingerprints
+(?:shodan|censysinspect|zoomeye|fofa|quake|hunterhow|netlas|criminalip|onyphe|leakix|binaryedge|securitytrails|spyse|fullhunt|projectdiscovery|httpx|nuclei)

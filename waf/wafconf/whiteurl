@@ -1,0 +1,8 @@
+\.(?:js|css)$
+\.(?:gif|jpg|jpeg|png|bmp|svg|webp|ico|map)$
+\.(?:woff|woff2|ttf|eot)$
+\.(?:mp4|flv|m3u8|ts)$
+^/captcha-waf\.html(?:\?.*)?$
+^/403\.html(?:\?.*)?$
+^/favicon\.ico$
+favicon\.ico
