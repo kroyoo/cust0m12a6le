@@ -37,6 +37,7 @@ access_by_lua_file "conf/waf/access.lua";
 Rule directory: `conf/waf/wafconf` (resolved from Nginx prefix).
 
 - `whiteip`, `blackip`
+- `whitereferer`
 - `whiteurl`, `blackurl`
 - `args`, `cookie`, `post`
 - `useragent`, `tencent_useragent`
@@ -52,6 +53,9 @@ IP rule format (`whiteip` / `blackip`):
 - This refactor intentionally removed legacy global/lib interfaces.
 - Existing custom code must use the new modules (`engine/checks/rules/request/responder/logger`).
 - Check order is configurable by `config.lua -> pipeline`.
+- `white_referer` is available but disabled by default (`switch.white_referer = false`).
+- `white_referer` matches full `Referer` header via regex and returns allow when matched.
+- `Referer` can be absent or forged; do not treat it as strong authentication.
 - Default behavior is fail-open (`runtime.fail_open = true`).
 - To trust `X-Forwarded-For`, set `trust.forwarded_ip = true` only behind trusted reverse proxy.
 - If output mode is `redirect`, update `output.redirect_url`.

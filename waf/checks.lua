@@ -184,6 +184,25 @@ function Checks.white_url(ctx)
     return nil
 end
 
+function Checks.white_referer(ctx)
+    if not C.switch.white_referer then
+        return nil
+    end
+
+    local referer = U.lower(ctx.referer)
+    if not referer or referer == "" then
+        return nil
+    end
+
+    local referer_unescaped = U.lower(U.safe_unescape(referer))
+    local rules = Rules.get("white_referer")
+    local rule = match_rule(referer, rules) or match_rule(referer_unescaped, rules)
+    if rule then
+        return allow("White_Referer", rule, referer, ctx)
+    end
+    return nil
+end
+
 function Checks.user_agent(ctx)
     if not C.switch.user_agent then
         return nil

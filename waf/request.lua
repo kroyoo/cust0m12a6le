@@ -127,6 +127,7 @@ function Request.new()
         headers = headers,
         client_ip = detect_client_ip(headers) or "-",
         user_agent = tostring(header_first(headers["user-agent"]) or header_first(headers["User-Agent"]) or ngx_var("http_user_agent") or ""),
+        referer = tostring(header_first(headers["referer"]) or header_first(headers["Referer"]) or ngx_var("http_referer") or ""),
         uri = uri,
         request_uri = request_uri,
         method = method,

@@ -1,0 +1,9 @@
+# One regex per line. Matched against full Referer value.
+# Referer can be empty/missing and can be forged by non-browser clients.
+# Use this only as convenience allow-list, not as strong auth.
+
+# Allow example friend sites:
+# ^https?://(?:[a-z0-9-]+\.)*friend\.com(?::\d+)?(?:[/?#].*)?$
+# ^https://(?:www\.)?friend-a\.com(?:/|$)
+# ^https://sub\.friend-b\.net(?:/|$)
+

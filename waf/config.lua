@@ -99,6 +99,7 @@ C.trust = {
 C.switch = {
     waf = true,
     white_url = true,
+    white_referer = false,
     white_ip = true,
     black_ip = true,
     url = true,
@@ -112,6 +113,7 @@ C.switch = {
 C.pipeline_default = {
     "black_ip",
     "white_ip",
+    "white_referer",
     "white_url",
     "user_agent",
     "cc",
@@ -262,6 +264,7 @@ C.page = {
 C.rule_files = {
     white_ip = "whiteip",
     black_ip = "blackip",
+    white_referer = "whitereferer",
     white_url = "whiteurl",
     black_url = "blackurl",
     args = "args",
