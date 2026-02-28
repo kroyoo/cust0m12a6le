@@ -165,16 +165,20 @@ Notes:
 
 Use these checks when challenge behavior is not as expected:
 
+Path note:
+
+- Current installer runtime path: `/usr/local/nginx-data/conf/...`
+
 ```bash
-# 1) Ensure waf include exists in final nginx.conf
-grep -n "include waf/waf.conf;" /usr/local/nginx/conf/nginx.conf
+# 1) Ensure waf include exists in runtime nginx.conf
+grep -n "include waf/waf.conf;" /usr/local/nginx-data/conf/nginx.conf
 
 # 2) Ensure WAF challenge route config is loaded
-grep -n "captcha_uri\\|captcha_verify_uri\\|provider\\|secret_key\\|site_key" /usr/local/nginx/conf/waf/config.lua
+grep -n "captcha_uri\\|captcha_verify_uri\\|provider\\|secret_key\\|site_key" /usr/local/nginx-data/conf/waf/config.lua
 
 # 3) Ensure resty.http is available to runtime
 ls -l /usr/local/share/lua/5.1/resty/http.lua
-ls -l /usr/local/nginx/conf/lua/resty/http.lua
+ls -l /usr/local/nginx-data/conf/lua/resty/http.lua
 
 # 4) Ensure service has LUA_PATH
 systemctl cat nginx | grep LUA_PATH
@@ -183,7 +187,7 @@ systemctl cat nginx | grep LUA_PATH
 curl -I https://challenges.cloudflare.com/turnstile/v0/siteverify
 
 # 6) Check rule cache TTL and current challenge/cc mode
-grep -n "rule_ttl\\|cc.action\\|provider\\|fail_open" /usr/local/nginx/conf/waf/config.lua
+grep -n "rule_ttl\\|cc.action\\|provider\\|fail_open" /usr/local/nginx-data/conf/waf/config.lua
 
 # 7) Check security event logs (if log.mode=file)
 tail -n 50 /data/wwwlogs/$(date +%F)_sec.log

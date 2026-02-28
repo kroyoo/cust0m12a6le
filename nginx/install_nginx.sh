@@ -7,9 +7,9 @@ IFS=$'\n\t'
 # Nginx source installer (vanilla Nginx + GeoIP2 + substitutions + Lua WAF).
 # - Targets latest stable components by default (auto-discovery with fallback).
 # - Integrates local or online waf/ directory into nginx.conf.
-# - Default mode is "stage": build/install candidate tree only, no live replacement.
-# - "promote" mode performs backup + cutover with rollback-on-error safeguards.
-# - Keeps runtime path simple: PID at /run/nginx.pid (no /var/run/nginx dir).
+# - Uses single release-layout workflow: build -> publish release -> switch current symlink.
+# - Runtime config is persistent under RUNTIME_PREFIX (separate from release binaries).
+# - Keeps runtime path simple: PID at /run/nginx.pid
 # -----------------------------------------------------------------------------
 
 SCRIPT_NAME="$(basename "$0")"
@@ -48,13 +48,19 @@ WAF_SOURCE_DIR="${WAF_SOURCE_DIR:-}"
 WAF_REPO_URL="${WAF_REPO_URL:-https://github.com/kroyoo/cust0m12a6le.git}"
 WAF_REPO_REF="${WAF_REPO_REF:-}"
 WAF_REPO_SUBDIR="${WAF_REPO_SUBDIR:-waf}"
-OPENRESTY_PREFIX="${OPENRESTY_PREFIX:-}"
+WAF_POLICY="${WAF_POLICY:-optional}"          # required | optional | disabled
+SYNC_WAF="${SYNC_WAF:-0}"                     # 1/0, sync runtime conf/waf during install flow
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/nginx-source-installer}"
 SERVICE_NAME="${SERVICE_NAME:-nginx}"
-INSTALL_MODE="${INSTALL_MODE:-stage}"         # stage | promote
-ACTIVATE_SERVICE="${ACTIVATE_SERVICE:-0}"     # 1/0, only used in promote mode
-LINK_NGINX_BIN="${LINK_NGINX_BIN:-0}"         # 1/0, only used in promote mode
+ACTIVATE_SERVICE="${ACTIVATE_SERVICE:-0}"     # 1/0, default off for manual verification before restart
+LINK_NGINX_BIN="${LINK_NGINX_BIN:-0}"         # 1/0, optionally link /usr/bin/nginx
 DRY_RUN="${DRY_RUN:-0}"                       # 1/0, print plan and exit
+REWRITE_UNIT="${REWRITE_UNIT:-1}"             # 1/0, rewrite systemd unit to current/runtime layout
+RELEASES_DIR="${RELEASES_DIR:-}"              # default resolved after args
+CURRENT_LINK="${CURRENT_LINK:-}"              # default resolved after args
+RUNTIME_PREFIX="${RUNTIME_PREFIX:-}"          # default resolved after args
+RELEASE_KEEP="${RELEASE_KEEP:-5}"             # keep newest N releases
+QUIET_CLEANUP="${QUIET_CLEANUP:-0}"           # suppress cleanup summary (used by --help)
 
 # ask | set | keep
 BRAND_MODE="${BRAND_MODE:-ask}"
@@ -69,19 +75,18 @@ OS_FAMILY=""
 PKG_MANAGER=""
 INSTALL_STAGE_ROOT=""
 CANDIDATE_PREFIX=""
-PROMOTE_IN_PROGRESS=0
-PROMOTE_TS=""
-LIVE_PREFIX_BACKUP=""
+UPGRADE_IN_PROGRESS=0
 SERVICE_UNIT_FILE=""
 SERVICE_UNIT_BACKUP=""
 HAD_SERVICE_UNIT=0
-HAD_LIVE_PREFIX=0
-LIVE_PREFIX_MOVED=0
-NEW_PREFIX_DEPLOYED=0
 SERVICE_UNIT_CHANGED=0
-OPENRESTY_PREFIX_DETECTED=""
+CURRENT_LINK_PREV_TARGET=""
+CURRENT_LINK_SWITCHED=0
+RELEASE_CANDIDATE_DIR=""
 WAF_EFFECTIVE_SOURCE_DIR=""
 WAF_REPO_CLONE_DIR=""
+CURRENT_PHASE_NAME=""
+CURRENT_PHASE_START_TS=0
 
 # Optional pinned refs for modules (empty means latest default branch)
 LUAJIT_REF="${LUAJIT_REF:-}"
@@ -126,8 +131,32 @@ log_info() { printf '%s %s[INFO]%s %s\n' "$(ts)" "${C_INFO}" "${C_RESET}" "$*"; 
 log_warn() { printf '%s %s[WARN]%s %s\n' "$(ts)" "${C_WARN}" "${C_RESET}" "$*"; }
 log_error() { printf '%s %s[ERROR]%s %s\n' "$(ts)" "${C_ERR}" "${C_RESET}" "$*" >&2; }
 die() { log_error "$*"; exit 1; }
+log_kv() {
+    local key="$1"
+    shift
+    log_info "$(printf '%-18s %s' "${key}:" "$*")"
+}
+
+finish_active_phase() {
+    local now_ts elapsed_seconds
+    [[ -n "${CURRENT_PHASE_NAME}" ]] || return 0
+
+    now_ts="$(date +%s)"
+    if [[ "${CURRENT_PHASE_START_TS}" =~ ^[0-9]+$ ]] && (( CURRENT_PHASE_START_TS > 0 )); then
+        elapsed_seconds=$((now_ts - CURRENT_PHASE_START_TS))
+        log_info "Phase completed: ${CURRENT_PHASE_NAME} (${elapsed_seconds}s)"
+    else
+        log_info "Phase completed: ${CURRENT_PHASE_NAME}"
+    fi
+
+    CURRENT_PHASE_NAME=""
+    CURRENT_PHASE_START_TS=0
+}
 
 phase() {
+    finish_active_phase
+    CURRENT_PHASE_NAME="$*"
+    CURRENT_PHASE_START_TS="$(date +%s)"
     printf '\n%s %s[PHASE]%s %s\n' "$(ts)" "${C_INFO}" "${C_RESET}" "$*"
 }
 
@@ -137,19 +166,29 @@ Usage: ${SCRIPT_NAME} [options]
 
 Options:
   -y, --yes                      Non-interactive mode (skip prompts)
-  --mode stage|promote           stage=build+candidate test only (default), promote=switch to live
-  --promote                      Shortcut for --mode promote
   --dry-run                      Print execution plan and detected paths, then exit
-  --activate                     Start/reload ${SERVICE_NAME} after successful promote
-  --link-bin                     Link /usr/bin/nginx to ${NGINX_PREFIX}/sbin/nginx in promote mode
+  --activate                     Start/reload ${SERVICE_NAME} after successful install (default: off)
+  --link-bin                     Link /usr/bin/nginx to active nginx binary path
+  --rewrite-unit                 Rewrite systemd unit to current/runtime layout (default: ${REWRITE_UNIT})
+  --no-rewrite-unit              Do not rewrite systemd unit
   --backup-root PATH             Backup path for live prefix/systemd backups (default: ${BACKUP_ROOT})
   --service-name NAME            systemd service name to manage (default: ${SERVICE_NAME})
   --prefix PATH                  Nginx install prefix (default: ${NGINX_PREFIX})
+  --runtime-prefix PATH          Runtime prefix for persistent config/state (default: auto)
+  --releases-dir PATH            Release directory (default: <prefix>/releases)
+  --current-link PATH            Current release symlink path (default: <prefix>/current)
+  --release-keep N               Keep newest N releases (default: ${RELEASE_KEEP})
   --brand NAME                   Set custom Server brand string
   --no-brand                     Keep upstream nginx branding
   --auto-latest 0|1              Discover latest stable versions at runtime (default: ${AUTO_LATEST})
   --no-jemalloc                  Disable jemalloc linking/build
   --waf-source local|online      WAF source mode (default: ${WAF_SOURCE_MODE})
+  --waf-policy required|optional|disabled
+                                 required: WAF source missing/fetch error stops execution
+                                 optional: WAF issues are skipped with warning
+                                 disabled: do not resolve/integrate/sync WAF
+  --sync-waf                     Sync runtime conf/waf from prepared source
+  --no-sync-waf                  Do not sync runtime conf/waf
   --online-waf                   Shortcut for --waf-source online
   --waf-source-dir PATH          Local waf directory (default: auto-detect ../waf then ./waf)
   --waf-repo URL                 Online WAF git repo (default: ${WAF_REPO_URL})
@@ -165,20 +204,18 @@ Options:
 
 Environment overrides:
   AUTO_LATEST, AUTO_CLEANUP, ASSUME_YES, ENABLE_JEMALLOC, JOBS
-  INSTALL_MODE, ACTIVATE_SERVICE, LINK_NGINX_BIN, DRY_RUN, BACKUP_ROOT, SERVICE_NAME
-  NGINX_PREFIX, NGINX_USER, NGINX_GROUP, LOG_DIR, PID_FILE, LUAJIT_PREFIX, LUA_SHARE_DIR, LUA_CPATH_DIR, OPENRESTY_PREFIX
-  WAF_SOURCE_MODE, WAF_SOURCE_DIR, WAF_REPO_URL, WAF_REPO_REF, WAF_REPO_SUBDIR
+  ACTIVATE_SERVICE, LINK_NGINX_BIN, DRY_RUN, BACKUP_ROOT, SERVICE_NAME
+  REWRITE_UNIT, RELEASES_DIR, CURRENT_LINK, RUNTIME_PREFIX, RELEASE_KEEP
+  NGINX_PREFIX, NGINX_USER, NGINX_GROUP, LOG_DIR, PID_FILE, LUAJIT_PREFIX, LUA_SHARE_DIR, LUA_CPATH_DIR
+  WAF_SOURCE_MODE, WAF_POLICY, SYNC_WAF, WAF_SOURCE_DIR, WAF_REPO_URL, WAF_REPO_REF, WAF_REPO_SUBDIR
   BRAND_MODE (ask|set|keep), BRAND_NAME
   NGINX_VERSION, OPENSSL_VERSION, PCRE2_VERSION, JEMALLOC_VERSION, LIBMAXMINDDB_VERSION
   LUAJIT_REF, NDK_REF, LUA_NGINX_REF, STREAM_LUA_REF, GEOIP2_REF, SUBS_REF, RESTY_CORE_REF, RESTY_LRUCACHE_REF, RESTY_HTTP_REF, LUA_CJSON_REF
   RESTY_CORE_REPO, RESTY_LRUCACHE_REPO, RESTY_HTTP_REPO, LUA_CJSON_REPO
-
-Notes:
-  OPENRESTY_PREFIX is optional manual override. If unset, script auto-detects from
-  openresty/nginx binaries and systemd unit files.
 EOF
 }
 
+# ----- Normalization and validation helpers -----------------------------------
 normalize_bool() {
     case "${1:-}" in
         1|true|TRUE|yes|YES|on|ON) printf '1\n' ;;
@@ -187,17 +224,31 @@ normalize_bool() {
     esac
 }
 
-normalize_mode() {
-    case "${1:-}" in
-        stage|promote) printf '%s\n' "$1" ;;
-        *) die "Invalid install mode: $1 (expected stage|promote)" ;;
-    esac
-}
-
 normalize_waf_source_mode() {
     case "${1:-}" in
         local|online) printf '%s\n' "$1" ;;
         *) die "Invalid WAF source mode: $1 (expected local|online)" ;;
+    esac
+}
+
+normalize_waf_policy() {
+    case "${1:-}" in
+        required|optional|disabled) printf '%s\n' "$1" ;;
+        *) die "Invalid WAF policy: $1 (expected required|optional|disabled)" ;;
+    esac
+}
+
+normalize_positive_int() {
+    case "${1:-}" in
+        ''|*[!0-9]*)
+            die "Invalid positive integer: ${1:-<empty>}"
+            ;;
+        0)
+            die "Invalid positive integer: 0"
+            ;;
+        *)
+            printf '%s\n' "$1"
+            ;;
     esac
 }
 
@@ -213,19 +264,111 @@ normalize_waf_subdir() {
     printf '%s\n' "${subdir}"
 }
 
+require_option_value() {
+    local opt="$1"
+    local argc="$2"
+    local msg="${3:-requires a value}"
+    (( argc >= 2 )) || die "${opt} ${msg}"
+}
+
+pin_version_value() {
+    local var_name="$1"
+    local value="$2"
+    printf -v "${var_name}" '%s' "${value}"
+    AUTO_LATEST=0
+}
+
+normalize_identifier() {
+    local name="$1"
+    local value="$2"
+    local pattern='^[A-Za-z0-9_.@-]+$'
+
+    [[ -n "${value}" ]] || die "${name} cannot be empty"
+    if [[ ! "${value}" =~ ${pattern} ]]; then
+        die "Invalid ${name}: ${value} (allowed: [A-Za-z0-9_.@-])"
+    fi
+    printf '%s\n' "${value}"
+}
+
+normalize_abs_path() {
+    local name="$1"
+    local value="$2"
+    local allow_root="${3:-0}"
+
+    [[ -n "${value}" ]] || die "${name} cannot be empty"
+    [[ "${value}" == /* ]] || die "${name} must be an absolute path: ${value}"
+
+    while [[ "${value}" != "/" && "${value}" == */ ]]; do
+        value="${value%/}"
+    done
+
+    if [[ "${allow_root}" != "1" && "${value}" == "/" ]]; then
+        die "${name} cannot be /"
+    fi
+    printf '%s\n' "${value}"
+}
+
+normalize_abs_file_path() {
+    local name="$1"
+    local value="$2"
+
+    value="$(normalize_abs_path "${name}" "${value}")"
+    [[ "${value}" != "/" ]] || die "${name} cannot be /"
+    [[ "${value}" != */ ]] || die "${name} cannot end with /: ${value}"
+    printf '%s\n' "${value}"
+}
+
+is_same_or_descendant_path() {
+    local child="$1"
+    local parent="$2"
+
+    child="${child%/}"
+    parent="${parent%/}"
+    if [[ "${parent}" == "/" ]]; then
+        return 0
+    fi
+    [[ "${child}" == "${parent}" || "${child}" == "${parent}/"* ]]
+}
+
+validate_layout_path_relationships() {
+    if is_same_or_descendant_path "${RUNTIME_PREFIX}" "${RELEASES_DIR}"; then
+        die "RUNTIME_PREFIX (${RUNTIME_PREFIX}) cannot be inside RELEASES_DIR (${RELEASES_DIR})"
+    fi
+    if is_same_or_descendant_path "${RELEASES_DIR}" "${RUNTIME_PREFIX}"; then
+        die "RELEASES_DIR (${RELEASES_DIR}) cannot be inside RUNTIME_PREFIX (${RUNTIME_PREFIX})"
+    fi
+    if is_same_or_descendant_path "${CURRENT_LINK}" "${RELEASES_DIR}"; then
+        die "CURRENT_LINK (${CURRENT_LINK}) cannot be inside RELEASES_DIR (${RELEASES_DIR})"
+    fi
+    if is_same_or_descendant_path "${CURRENT_LINK}" "${RUNTIME_PREFIX}"; then
+        die "CURRENT_LINK (${CURRENT_LINK}) cannot be inside RUNTIME_PREFIX (${RUNTIME_PREFIX})"
+    fi
+}
+
+resolve_layout_defaults() {
+    if [[ -z "${RUNTIME_PREFIX}" ]]; then
+        if [[ "${NGINX_PREFIX}" == "/usr/local/nginx" ]]; then
+            RUNTIME_PREFIX="/usr/local/nginx-data"
+        else
+            RUNTIME_PREFIX="${NGINX_PREFIX}-data"
+        fi
+    fi
+
+    if [[ -z "${RELEASES_DIR}" ]]; then
+        RELEASES_DIR="${NGINX_PREFIX}/releases"
+    fi
+
+    if [[ -z "${CURRENT_LINK}" ]]; then
+        CURRENT_LINK="${NGINX_PREFIX}/current"
+    fi
+}
+
+# ----- CLI parsing -------------------------------------------------------------
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -y|--yes)
                 ASSUME_YES=1
-                ;;
-            --mode)
-                [[ $# -ge 2 ]] || die "--mode requires stage|promote"
-                INSTALL_MODE="$2"
-                shift
-                ;;
-            --promote)
-                INSTALL_MODE="promote"
                 ;;
             --dry-run)
                 DRY_RUN=1
@@ -236,23 +379,49 @@ parse_args() {
             --link-bin)
                 LINK_NGINX_BIN=1
                 ;;
+            --rewrite-unit)
+                REWRITE_UNIT=1
+                ;;
+            --no-rewrite-unit)
+                REWRITE_UNIT=0
+                ;;
             --backup-root)
-                [[ $# -ge 2 ]] || die "--backup-root requires a value"
+                require_option_value "$1" "$#"
                 BACKUP_ROOT="$2"
                 shift
                 ;;
             --service-name)
-                [[ $# -ge 2 ]] || die "--service-name requires a value"
+                require_option_value "$1" "$#"
                 SERVICE_NAME="$2"
                 shift
                 ;;
             --prefix)
-                [[ $# -ge 2 ]] || die "--prefix requires a value"
+                require_option_value "$1" "$#"
                 NGINX_PREFIX="$2"
                 shift
                 ;;
+            --runtime-prefix)
+                require_option_value "$1" "$#"
+                RUNTIME_PREFIX="$2"
+                shift
+                ;;
+            --releases-dir)
+                require_option_value "$1" "$#"
+                RELEASES_DIR="$2"
+                shift
+                ;;
+            --current-link)
+                require_option_value "$1" "$#"
+                CURRENT_LINK="$2"
+                shift
+                ;;
+            --release-keep)
+                require_option_value "$1" "$#"
+                RELEASE_KEEP="$2"
+                shift
+                ;;
             --brand)
-                [[ $# -ge 2 ]] || die "--brand requires a value"
+                require_option_value "$1" "$#"
                 BRAND_MODE="set"
                 BRAND_NAME="$2"
                 shift
@@ -261,7 +430,7 @@ parse_args() {
                 BRAND_MODE="keep"
                 ;;
             --auto-latest)
-                [[ $# -ge 2 ]] || die "--auto-latest requires 0 or 1"
+                require_option_value "$1" "$#" "requires 0 or 1"
                 AUTO_LATEST="$2"
                 shift
                 ;;
@@ -269,69 +438,76 @@ parse_args() {
                 ENABLE_JEMALLOC=0
                 ;;
             --waf-source)
-                [[ $# -ge 2 ]] || die "--waf-source requires local|online"
+                require_option_value "$1" "$#" "requires local|online"
                 WAF_SOURCE_MODE="$2"
                 shift
+                ;;
+            --waf-policy)
+                require_option_value "$1" "$#" "requires required|optional|disabled"
+                WAF_POLICY="$2"
+                shift
+                ;;
+            --sync-waf)
+                SYNC_WAF=1
+                ;;
+            --no-sync-waf)
+                SYNC_WAF=0
                 ;;
             --online-waf)
                 WAF_SOURCE_MODE="online"
                 ;;
             --waf-source-dir)
-                [[ $# -ge 2 ]] || die "--waf-source-dir requires a value"
+                require_option_value "$1" "$#"
                 WAF_SOURCE_DIR="$2"
                 shift
                 ;;
             --waf-repo)
-                [[ $# -ge 2 ]] || die "--waf-repo requires a value"
+                require_option_value "$1" "$#"
                 WAF_REPO_URL="$2"
                 shift
                 ;;
             --waf-ref)
-                [[ $# -ge 2 ]] || die "--waf-ref requires a value"
+                require_option_value "$1" "$#"
                 WAF_REPO_REF="$2"
                 shift
                 ;;
             --waf-subdir)
-                [[ $# -ge 2 ]] || die "--waf-subdir requires a value"
+                require_option_value "$1" "$#"
                 WAF_REPO_SUBDIR="$2"
                 shift
                 ;;
             --workdir)
-                [[ $# -ge 2 ]] || die "--workdir requires a value"
+                require_option_value "$1" "$#"
                 WORKDIR="$2"
                 shift
                 ;;
             --nginx-version)
-                [[ $# -ge 2 ]] || die "--nginx-version requires a value"
-                NGINX_VERSION="$2"
-                AUTO_LATEST=0
+                require_option_value "$1" "$#"
+                pin_version_value "NGINX_VERSION" "$2"
                 shift
                 ;;
             --openssl-version)
-                [[ $# -ge 2 ]] || die "--openssl-version requires a value"
-                OPENSSL_VERSION="$2"
-                AUTO_LATEST=0
+                require_option_value "$1" "$#"
+                pin_version_value "OPENSSL_VERSION" "$2"
                 shift
                 ;;
             --pcre2-version)
-                [[ $# -ge 2 ]] || die "--pcre2-version requires a value"
-                PCRE2_VERSION="$2"
-                AUTO_LATEST=0
+                require_option_value "$1" "$#"
+                pin_version_value "PCRE2_VERSION" "$2"
                 shift
                 ;;
             --jemalloc-version)
-                [[ $# -ge 2 ]] || die "--jemalloc-version requires a value"
-                JEMALLOC_VERSION="$2"
-                AUTO_LATEST=0
+                require_option_value "$1" "$#"
+                pin_version_value "JEMALLOC_VERSION" "$2"
                 shift
                 ;;
             --libmaxminddb-version)
-                [[ $# -ge 2 ]] || die "--libmaxminddb-version requires a value"
-                LIBMAXMINDDB_VERSION="$2"
-                AUTO_LATEST=0
+                require_option_value "$1" "$#"
+                pin_version_value "LIBMAXMINDDB_VERSION" "$2"
                 shift
                 ;;
             -h|--help)
+                QUIET_CLEANUP=1
                 usage
                 exit 0
                 ;;
@@ -341,17 +517,17 @@ parse_args() {
         esac
         shift
     done
-    INSTALL_MODE="$(normalize_mode "${INSTALL_MODE}")"
 }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# ----- Error handling and lifecycle -------------------------------------------
 on_error() {
-    local lineno="$1"
-    local cmd="$2"
-    log_error "Failed at line ${lineno}: ${cmd}"
+    local line_no="$1"
+    local failed_command="$2"
+    log_error "Failed at line ${line_no}: ${failed_command}"
     if [[ -n "${SERVICE_NAME:-}" ]]; then
-        log_error "Context: SERVICE_NAME=${SERVICE_NAME} INSTALL_MODE=${INSTALL_MODE:-unknown} NGINX_PREFIX=${NGINX_PREFIX:-unknown}"
+        log_error "Context: SERVICE_NAME=${SERVICE_NAME} NGINX_PREFIX=${NGINX_PREFIX:-unknown} RUNTIME_PREFIX=${RUNTIME_PREFIX:-unknown}"
         if command_exists systemctl; then
             local svc_state
             svc_state="$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true)"
@@ -361,48 +537,50 @@ on_error() {
 }
 
 rollback_if_needed() {
-    [[ "${PROMOTE_IN_PROGRESS}" == "1" ]] || return 0
+    if [[ "${UPGRADE_IN_PROGRESS}" == "1" ]]; then
+        log_warn "Upgrade failed. Attempting rollback..."
 
-    log_warn "Promotion failed. Attempting rollback..."
-
-    if [[ "${SERVICE_UNIT_CHANGED}" == "1" ]]; then
-        if [[ "${HAD_SERVICE_UNIT}" == "1" && -n "${SERVICE_UNIT_BACKUP}" && -f "${SERVICE_UNIT_BACKUP}" ]]; then
-            cp -a "${SERVICE_UNIT_BACKUP}" "${SERVICE_UNIT_FILE}" || true
-            log_warn "Restored systemd unit from backup: ${SERVICE_UNIT_BACKUP}"
-        elif [[ "${HAD_SERVICE_UNIT}" == "0" && -n "${SERVICE_UNIT_FILE}" && -f "${SERVICE_UNIT_FILE}" ]]; then
-            rm -f "${SERVICE_UNIT_FILE}" || true
-            log_warn "Removed newly created systemd unit: ${SERVICE_UNIT_FILE}"
+        if [[ "${SERVICE_UNIT_CHANGED}" == "1" ]]; then
+            if [[ "${HAD_SERVICE_UNIT}" == "1" && -n "${SERVICE_UNIT_BACKUP}" && -f "${SERVICE_UNIT_BACKUP}" ]]; then
+                cp -a "${SERVICE_UNIT_BACKUP}" "${SERVICE_UNIT_FILE}" || true
+                log_warn "Restored systemd unit from backup: ${SERVICE_UNIT_BACKUP}"
+            elif [[ "${HAD_SERVICE_UNIT}" == "0" && -n "${SERVICE_UNIT_FILE}" && -f "${SERVICE_UNIT_FILE}" ]]; then
+                rm -f "${SERVICE_UNIT_FILE}" || true
+                log_warn "Removed newly created systemd unit: ${SERVICE_UNIT_FILE}"
+            fi
         fi
-    fi
 
-    if [[ "${NEW_PREFIX_DEPLOYED}" == "1" && -n "${NGINX_PREFIX}" && -d "${NGINX_PREFIX}" ]]; then
-        rm -rf "${NGINX_PREFIX}" || true
-    fi
+        if [[ "${CURRENT_LINK_SWITCHED}" == "1" ]]; then
+            if [[ -n "${CURRENT_LINK_PREV_TARGET}" && -d "${CURRENT_LINK_PREV_TARGET}" ]]; then
+                ln -sfn "${CURRENT_LINK_PREV_TARGET}" "${CURRENT_LINK}" || true
+                log_warn "Restored current symlink to previous release: ${CURRENT_LINK_PREV_TARGET}"
+            else
+                rm -f "${CURRENT_LINK}" || true
+                log_warn "Removed current symlink due to missing previous release target."
+            fi
+        fi
 
-    if [[ "${LIVE_PREFIX_MOVED}" == "1" && "${HAD_LIVE_PREFIX}" == "1" && -n "${LIVE_PREFIX_BACKUP}" && -d "${LIVE_PREFIX_BACKUP}" ]]; then
-        mv "${LIVE_PREFIX_BACKUP}" "${NGINX_PREFIX}" || true
-        log_warn "Restored previous live prefix from backup: ${LIVE_PREFIX_BACKUP}"
-    fi
+        if command_exists systemctl; then
+            systemctl daemon-reload || true
+        fi
 
-    if command_exists systemctl; then
-        systemctl daemon-reload || true
+        UPGRADE_IN_PROGRESS=0
     fi
-
-    PROMOTE_IN_PROGRESS=0
 }
 
 cleanup() {
-    local rc=$?
+    local exit_code=$?
     set +e
+
+    if [[ "${QUIET_CLEANUP}" == "1" ]]; then
+        exit "${exit_code}"
+    fi
+
     local cleanup_mode="${AUTO_CLEANUP}"
     if [[ "${DRY_RUN}" == "1" ]]; then
         cleanup_mode="0"
     fi
-    if [[ "${INSTALL_MODE}" == "stage" && "${cleanup_mode}" == "1" ]]; then
-        cleanup_mode="0"
-        log_warn "Stage mode detected: keep workdir for manual verification (set AUTO_CLEANUP=1 and --promote for auto cleanup)."
-    fi
-    if [[ "${rc}" -ne 0 ]]; then
+    if [[ "${exit_code}" -ne 0 ]]; then
         rollback_if_needed
     fi
     if [[ "${cleanup_mode}" == "1" && "${WORKDIR_CREATED}" == "1" && -n "${WORKDIR}" && -d "${WORKDIR}" ]]; then
@@ -412,9 +590,10 @@ cleanup() {
         log_warn "Keeping workdir: ${WORKDIR}"
     fi
 
-    local elapsed=$(( "$(date +%s)" - START_TS ))
-    log_info "Total elapsed: ${elapsed}s"
-    exit "${rc}"
+    finish_active_phase
+    local elapsed_seconds=$(( "$(date +%s)" - START_TS ))
+    log_info "Total elapsed: ${elapsed_seconds}s"
+    exit "${exit_code}"
 }
 
 trap 'on_error "${LINENO}" "${BASH_COMMAND}"' ERR
@@ -424,131 +603,15 @@ ensure_root() {
     [[ "$(id -u)" -eq 0 ]] || die "Run as root."
 }
 
-extract_prefix_from_v_output() {
-    local out="$1"
-    printf '%s\n' "${out}" | sed -n 's/.*--prefix=\([^ ]*\).*/\1/p' | head -n1
-}
-
-extract_conf_path_from_v_output() {
-    local out="$1"
-    printf '%s\n' "${out}" | sed -n 's/.*--conf-path=\([^ ]*\).*/\1/p' | head -n1
-}
-
-derive_openresty_root_from_path() {
-    local p="$1"
-    [[ -n "${p}" ]] || return 1
-    p="$(readlink -f "${p}" 2>/dev/null || printf '%s' "${p}")"
-    p="${p%/}"
-
-    if [[ "${p}" == */openresty ]]; then
-        printf '%s\n' "${p}"
-        return 0
-    fi
-
-    if [[ "${p}" == *"/openresty/"* ]]; then
-        printf '%s\n' "${p%%/openresty/*}/openresty"
-        return 0
-    fi
-
-    if [[ "$(basename "${p}")" == "nginx" && "$(basename "$(dirname "${p}")")" == "openresty" ]]; then
-        printf '%s\n' "$(dirname "${p}")"
-        return 0
-    fi
-
-    return 1
-}
-
-detect_openresty_prefix() {
-    local p out prefix unit
-    local -a candidates=()
-
-    add_candidate() {
-        local v="$1"
-        local e
-        [[ -n "${v}" ]] || return 0
-        v="${v%/}"
-        for e in "${candidates[@]:-}"; do
-            if [[ "${e}" == "${v}" ]]; then
-                return 0
-            fi
-        done
-        candidates+=("${v}")
-    }
-
-    if [[ -n "${OPENRESTY_PREFIX}" ]]; then
-        add_candidate "${OPENRESTY_PREFIX}"
-    fi
-
-    if command_exists openresty; then
-        p="$(command -v openresty 2>/dev/null || true)"
-        p="$(derive_openresty_root_from_path "${p}" 2>/dev/null || true)"
-        add_candidate "${p}"
-
-        out="$(openresty -V 2>&1 || true)"
-        prefix="$(extract_prefix_from_v_output "${out}")"
-        p="$(derive_openresty_root_from_path "${prefix}" 2>/dev/null || true)"
-        add_candidate "${p}"
-        prefix="$(extract_conf_path_from_v_output "${out}")"
-        p="$(derive_openresty_root_from_path "${prefix}" 2>/dev/null || true)"
-        add_candidate "${p}"
-    fi
-
-    if command_exists nginx; then
-        out="$(nginx -V 2>&1 || true)"
-        prefix="$(extract_prefix_from_v_output "${out}")"
-        p="$(derive_openresty_root_from_path "${prefix}" 2>/dev/null || true)"
-        add_candidate "${p}"
-        prefix="$(extract_conf_path_from_v_output "${out}")"
-        p="$(derive_openresty_root_from_path "${prefix}" 2>/dev/null || true)"
-        add_candidate "${p}"
-    fi
-
-    if command_exists systemctl; then
-        for unit in openresty.service nginx.service; do
-            local fragment=""
-            fragment="$(systemctl show -p FragmentPath --value "${unit}" 2>/dev/null || true)"
-            if [[ -n "${fragment}" && -f "${fragment}" ]]; then
-                while IFS= read -r p; do
-                    p="$(derive_openresty_root_from_path "${p}" 2>/dev/null || true)"
-                    add_candidate "${p}"
-                done < <(grep -Eo '/[^[:space:]]*openresty[^[:space:]]*' "${fragment}" || true)
-            fi
-        done
-    fi
-
-    if [[ -z "${OPENRESTY_PREFIX}" && -d "/usr/local/openresty" ]]; then
-        add_candidate "/usr/local/openresty"
-    fi
-
-    OPENRESTY_PREFIX_DETECTED=""
-    for p in "${candidates[@]:-}"; do
-        if [[ -d "${p}" ]]; then
-            OPENRESTY_PREFIX_DETECTED="${p}"
-            break
-        fi
-    done
-    if [[ -z "${OPENRESTY_PREFIX_DETECTED}" && ${#candidates[@]} -gt 0 ]]; then
-        OPENRESTY_PREFIX_DETECTED="${candidates[0]}"
-    fi
-}
-
 safety_guard() {
-    detect_openresty_prefix
-
-    if [[ -n "${OPENRESTY_PREFIX_DETECTED}" ]]; then
-        case "${NGINX_PREFIX}" in
-            "${OPENRESTY_PREFIX_DETECTED}"|${OPENRESTY_PREFIX_DETECTED}/*)
-                die "NGINX_PREFIX (${NGINX_PREFIX}) overlaps detected OpenResty prefix (${OPENRESTY_PREFIX_DETECTED}); refuse to modify openresty tree."
-                ;;
-        esac
-        if [[ -d "${OPENRESTY_PREFIX_DETECTED}" ]]; then
-            log_info "Detected existing OpenResty at ${OPENRESTY_PREFIX_DETECTED}. This script will not delete or modify that directory."
-        fi
-    else
-        log_warn "OpenResty path not detected from binaries/systemd. Continuing with caution."
-    fi
+    case "${NGINX_PREFIX}" in
+        ''|/)
+            die "Invalid NGINX_PREFIX: ${NGINX_PREFIX:-<empty>}"
+            ;;
+    esac
 }
 
+# ----- Environment and dependency discovery -----------------------------------
 detect_os() {
     [[ -f /etc/os-release ]] || die "/etc/os-release not found."
     # shellcheck disable=SC1091
@@ -631,8 +694,9 @@ install_build_deps() {
     esac
 }
 
+# ----- Version resolution ------------------------------------------------------
 discover_nginx_stable() {
-    local listing versions v minor
+    local listing versions candidate_version minor
     listing="$(fetch_url "https://nginx.org/download/")" || return 1
     versions="$(printf '%s' "${listing}" \
         | grep -Eo 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
@@ -640,10 +704,10 @@ discover_nginx_stable() {
         | sort -Vu)"
     [[ -n "${versions}" ]] || return 1
 
-    while IFS= read -r v; do
-        minor="$(printf '%s' "${v}" | cut -d. -f2)"
+    while IFS= read -r candidate_version; do
+        minor="$(printf '%s' "${candidate_version}" | cut -d. -f2)"
         if [[ "${minor}" =~ ^[0-9]+$ ]] && (( minor % 2 == 0 )); then
-            printf '%s\n' "${v}"
+            printf '%s\n' "${candidate_version}"
             return 0
         fi
     done < <(printf '%s\n' "${versions}" | sort -Vr)
@@ -682,26 +746,57 @@ resolve_versions() {
     ACTIVATE_SERVICE="$(normalize_bool "${ACTIVATE_SERVICE}")"
     LINK_NGINX_BIN="$(normalize_bool "${LINK_NGINX_BIN}")"
     DRY_RUN="$(normalize_bool "${DRY_RUN}")"
-    INSTALL_MODE="$(normalize_mode "${INSTALL_MODE}")"
+    REWRITE_UNIT="$(normalize_bool "${REWRITE_UNIT}")"
+    SYNC_WAF="$(normalize_bool "${SYNC_WAF}")"
+    WAF_POLICY="$(normalize_waf_policy "${WAF_POLICY}")"
+    RELEASE_KEEP="$(normalize_positive_int "${RELEASE_KEEP}")"
+    resolve_layout_defaults
+
+    SERVICE_NAME="$(normalize_identifier "SERVICE_NAME" "${SERVICE_NAME}")"
+    NGINX_USER="$(normalize_identifier "NGINX_USER" "${NGINX_USER}")"
+    NGINX_GROUP="$(normalize_identifier "NGINX_GROUP" "${NGINX_GROUP}")"
+
+    NGINX_PREFIX="$(normalize_abs_path "NGINX_PREFIX" "${NGINX_PREFIX}")"
+    RUNTIME_PREFIX="$(normalize_abs_path "RUNTIME_PREFIX" "${RUNTIME_PREFIX}")"
+    RELEASES_DIR="$(normalize_abs_path "RELEASES_DIR" "${RELEASES_DIR}")"
+    CURRENT_LINK="$(normalize_abs_path "CURRENT_LINK" "${CURRENT_LINK}")"
+    BACKUP_ROOT="$(normalize_abs_path "BACKUP_ROOT" "${BACKUP_ROOT}")"
+    LOG_DIR="$(normalize_abs_path "LOG_DIR" "${LOG_DIR}")"
+    PID_FILE="$(normalize_abs_file_path "PID_FILE" "${PID_FILE}")"
+    if [[ -n "${WORKDIR}" ]]; then
+        WORKDIR="$(normalize_abs_path "WORKDIR" "${WORKDIR}")"
+    fi
+    if [[ -n "${WAF_SOURCE_DIR}" && "${WAF_SOURCE_DIR}" == /* ]]; then
+        WAF_SOURCE_DIR="$(normalize_abs_path "WAF_SOURCE_DIR" "${WAF_SOURCE_DIR}")"
+    fi
+    validate_layout_path_relationships
+
+    log_kv "Install profile" "release-layout"
+    log_kv "Dry run" "${DRY_RUN}"
+    log_kv "WAF policy" "${WAF_POLICY}"
+    log_kv "Sync WAF" "${SYNC_WAF}"
+    log_kv "Runtime prefix" "${RUNTIME_PREFIX}"
+    log_kv "Releases dir" "${RELEASES_DIR}"
+    log_kv "Current link" "${CURRENT_LINK}"
+    log_kv "Release keep" "${RELEASE_KEEP}"
 
     if [[ "${AUTO_LATEST}" == "1" ]]; then
-        local v
-        if v="$(discover_nginx_stable)"; then NGINX_VERSION="${v}"; else log_warn "Failed to discover nginx stable; using ${NGINX_VERSION}"; fi
-        if v="$(discover_semver_from_github_latest_release "openssl/openssl" "openssl-")"; then OPENSSL_VERSION="${v}"; else log_warn "Failed to discover OpenSSL; using ${OPENSSL_VERSION}"; fi
-        if v="$(discover_semver_from_github_latest_release "PCRE2Project/pcre2" "pcre2-")"; then PCRE2_VERSION="${v}"; else log_warn "Failed to discover PCRE2; using ${PCRE2_VERSION}"; fi
-        if v="$(discover_semver_from_github_latest_release "jemalloc/jemalloc" "")"; then JEMALLOC_VERSION="${v}"; else log_warn "Failed to discover jemalloc; using ${JEMALLOC_VERSION}"; fi
-        if v="$(discover_semver_from_github_latest_release "maxmind/libmaxminddb" "")"; then LIBMAXMINDDB_VERSION="${v}"; else log_warn "Failed to discover libmaxminddb; using ${LIBMAXMINDDB_VERSION}"; fi
+        local discovered_version
+        if discovered_version="$(discover_nginx_stable)"; then NGINX_VERSION="${discovered_version}"; else log_warn "Failed to discover nginx stable; using ${NGINX_VERSION}"; fi
+        if discovered_version="$(discover_semver_from_github_latest_release "openssl/openssl" "openssl-")"; then OPENSSL_VERSION="${discovered_version}"; else log_warn "Failed to discover OpenSSL; using ${OPENSSL_VERSION}"; fi
+        if discovered_version="$(discover_semver_from_github_latest_release "PCRE2Project/pcre2" "pcre2-")"; then PCRE2_VERSION="${discovered_version}"; else log_warn "Failed to discover PCRE2; using ${PCRE2_VERSION}"; fi
+        if discovered_version="$(discover_semver_from_github_latest_release "jemalloc/jemalloc" "")"; then JEMALLOC_VERSION="${discovered_version}"; else log_warn "Failed to discover jemalloc; using ${JEMALLOC_VERSION}"; fi
+        if discovered_version="$(discover_semver_from_github_latest_release "maxmind/libmaxminddb" "")"; then LIBMAXMINDDB_VERSION="${discovered_version}"; else log_warn "Failed to discover libmaxminddb; using ${LIBMAXMINDDB_VERSION}"; fi
     fi
 
-    log_info "Nginx version:        ${NGINX_VERSION}"
-    log_info "OpenSSL version:      ${OPENSSL_VERSION}"
-    log_info "PCRE2 version:        ${PCRE2_VERSION}"
-    log_info "jemalloc version:     ${JEMALLOC_VERSION}"
-    log_info "libmaxminddb version: ${LIBMAXMINDDB_VERSION}"
-    log_info "Install mode:         ${INSTALL_MODE}"
-    log_info "Dry run:              ${DRY_RUN}"
+    log_kv "Nginx version" "${NGINX_VERSION}"
+    log_kv "OpenSSL version" "${OPENSSL_VERSION}"
+    log_kv "PCRE2 version" "${PCRE2_VERSION}"
+    log_kv "jemalloc version" "${JEMALLOC_VERSION}"
+    log_kv "libmaxminddb version" "${LIBMAXMINDDB_VERSION}"
 }
 
+# ----- Runtime option resolution ----------------------------------------------
 resolve_brand() {
     if [[ "${DRY_RUN}" == "1" && "${BRAND_MODE}" == "ask" ]]; then
         TARGET_BRAND=""
@@ -748,6 +843,12 @@ resolve_waf_source() {
     WAF_SOURCE_MODE="$(normalize_waf_source_mode "${WAF_SOURCE_MODE}")"
     WAF_REPO_SUBDIR="$(normalize_waf_subdir "${WAF_REPO_SUBDIR}")"
 
+    if [[ "${WAF_POLICY}" == "disabled" ]]; then
+        WAF_EFFECTIVE_SOURCE_DIR=""
+        log_info "WAF policy disabled: skip source resolution."
+        return 0
+    fi
+
     if [[ "${WAF_SOURCE_MODE}" == "local" ]]; then
         if [[ -z "${WAF_SOURCE_DIR}" ]]; then
             if [[ -d "${SCRIPT_DIR}/../waf" ]]; then
@@ -759,22 +860,26 @@ resolve_waf_source() {
 
         if [[ -d "${WAF_SOURCE_DIR}" ]]; then
             WAF_EFFECTIVE_SOURCE_DIR="$(readlink -f "${WAF_SOURCE_DIR}" 2>/dev/null || printf '%s' "${WAF_SOURCE_DIR}")"
-            log_info "WAF source mode:      local"
-            log_info "WAF local source:     ${WAF_EFFECTIVE_SOURCE_DIR}"
+            log_kv "WAF source mode" "local"
+            log_kv "WAF local source" "${WAF_EFFECTIVE_SOURCE_DIR}"
         else
             WAF_EFFECTIVE_SOURCE_DIR=""
+            if [[ "${WAF_POLICY}" == "required" ]]; then
+                die "WAF source mode is local but directory is missing: ${WAF_SOURCE_DIR}"
+            fi
             log_warn "WAF source mode is local but directory is missing: ${WAF_SOURCE_DIR} (WAF integration will be skipped)."
         fi
         return 0
     fi
 
     WAF_EFFECTIVE_SOURCE_DIR=""
-    log_info "WAF source mode:      online"
-    log_info "WAF repo:             ${WAF_REPO_URL}"
-    log_info "WAF repo ref:         ${WAF_REPO_REF:-<default branch>}"
-    log_info "WAF repo subdir:      ${WAF_REPO_SUBDIR}"
+    log_kv "WAF source mode" "online"
+    log_kv "WAF repo" "${WAF_REPO_URL}"
+    log_kv "WAF repo ref" "${WAF_REPO_REF:-<default branch>}"
+    log_kv "WAF repo subdir" "${WAF_REPO_SUBDIR}"
 }
 
+# ----- Build workspace and sources --------------------------------------------
 prepare_workspace() {
     phase "Prepare workspace"
     if [[ -z "${WORKDIR}" ]]; then
@@ -791,18 +896,30 @@ prepare_workspace() {
 }
 
 prepare_waf_source() {
-    if [[ "${WAF_SOURCE_MODE}" != "online" ]]; then
+    if [[ "${WAF_POLICY}" == "disabled" || "${WAF_SOURCE_MODE}" != "online" ]]; then
         return 0
     fi
 
     phase "Fetch online WAF source"
     WAF_REPO_CLONE_DIR="${SRC_DIR}/waf-source-repo"
-    clone_repo_once "${WAF_REPO_URL}" "${WAF_REPO_CLONE_DIR}" "${WAF_REPO_REF}" || \
-        die "Failed to fetch online WAF repo: ${WAF_REPO_URL}"
+    if ! clone_repo_once "${WAF_REPO_URL}" "${WAF_REPO_CLONE_DIR}" "${WAF_REPO_REF}"; then
+        WAF_EFFECTIVE_SOURCE_DIR=""
+        if [[ "${WAF_POLICY}" == "required" ]]; then
+            die "Failed to fetch online WAF repo: ${WAF_REPO_URL}"
+        fi
+        log_warn "Failed to fetch online WAF repo: ${WAF_REPO_URL} (skip WAF integration)"
+        return 0
+    fi
 
     WAF_EFFECTIVE_SOURCE_DIR="${WAF_REPO_CLONE_DIR}/${WAF_REPO_SUBDIR}"
-    [[ -d "${WAF_EFFECTIVE_SOURCE_DIR}" ]] || \
-        die "WAF subdir not found: ${WAF_REPO_SUBDIR} (repo=${WAF_REPO_URL}, ref=${WAF_REPO_REF:-default})"
+    if [[ ! -d "${WAF_EFFECTIVE_SOURCE_DIR}" ]]; then
+        WAF_EFFECTIVE_SOURCE_DIR=""
+        if [[ "${WAF_POLICY}" == "required" ]]; then
+            die "WAF subdir not found: ${WAF_REPO_SUBDIR} (repo=${WAF_REPO_URL}, ref=${WAF_REPO_REF:-default})"
+        fi
+        log_warn "WAF subdir not found: ${WAF_REPO_SUBDIR} (repo=${WAF_REPO_URL}, ref=${WAF_REPO_REF:-default}); skip WAF integration"
+        return 0
+    fi
 
     log_info "Online WAF source ready: ${WAF_EFFECTIVE_SOURCE_DIR}"
 }
@@ -916,6 +1033,7 @@ download_modules() {
     clone_module "${SRC_DIR}/lua-cjson" "${LUA_CJSON_REF}" "${LUA_CJSON_REPO}"
 }
 
+# ----- Build Lua and native dependencies --------------------------------------
 build_jemalloc() {
     [[ "${ENABLE_JEMALLOC}" == "1" ]] || { log_info "jemalloc disabled."; return 0; }
     phase "Build jemalloc"
@@ -995,6 +1113,15 @@ EOF
     fi
 }
 
+copy_module_lua_lib_if_exists() {
+    local module_name="$1"
+    local dst_dir="$2"
+    local src_dir="${SRC_DIR}/${module_name}/lib"
+
+    [[ -d "${src_dir}" ]] || return 0
+    cp -a "${src_dir}/." "${dst_dir}/"
+}
+
 install_lua_resty_runtime() {
     phase "Install lua-resty runtime libraries"
 
@@ -1002,15 +1129,9 @@ install_lua_resty_runtime() {
     mkdir -p "${LUA_SHARE_DIR}/resty"
     mkdir -p "${LUA_CPATH_DIR}"
 
-    if [[ -d "${SRC_DIR}/lua-resty-core/lib" ]]; then
-        cp -a "${SRC_DIR}/lua-resty-core/lib/." "${LUA_SHARE_DIR}/"
-    fi
-    if [[ -d "${SRC_DIR}/lua-resty-lrucache/lib" ]]; then
-        cp -a "${SRC_DIR}/lua-resty-lrucache/lib/." "${LUA_SHARE_DIR}/"
-    fi
-    if [[ -d "${SRC_DIR}/lua-resty-http/lib" ]]; then
-        cp -a "${SRC_DIR}/lua-resty-http/lib/." "${LUA_SHARE_DIR}/"
-    fi
+    copy_module_lua_lib_if_exists "lua-resty-core" "${LUA_SHARE_DIR}"
+    copy_module_lua_lib_if_exists "lua-resty-lrucache" "${LUA_SHARE_DIR}"
+    copy_module_lua_lib_if_exists "lua-resty-http" "${LUA_SHARE_DIR}"
 
     [[ -f "${LUA_SHARE_DIR}/resty/core.lua" ]] || die "lua-resty-core install failed: ${LUA_SHARE_DIR}/resty/core.lua missing"
     [[ -f "${LUA_SHARE_DIR}/resty/http.lua" ]] || log_warn "lua-resty-http not found at ${LUA_SHARE_DIR}/resty/http.lua (turnstile verify may be unavailable)"
@@ -1026,15 +1147,9 @@ install_candidate_lua_runtime() {
     mkdir -p "${candidate_lua_dir}"
     mkdir -p "${candidate_lua_dir}/cjson"
 
-    if [[ -d "${SRC_DIR}/lua-resty-core/lib" ]]; then
-        cp -a "${SRC_DIR}/lua-resty-core/lib/." "${candidate_lua_dir}/"
-    fi
-    if [[ -d "${SRC_DIR}/lua-resty-lrucache/lib" ]]; then
-        cp -a "${SRC_DIR}/lua-resty-lrucache/lib/." "${candidate_lua_dir}/"
-    fi
-    if [[ -d "${SRC_DIR}/lua-resty-http/lib" ]]; then
-        cp -a "${SRC_DIR}/lua-resty-http/lib/." "${candidate_lua_dir}/"
-    fi
+    copy_module_lua_lib_if_exists "lua-resty-core" "${candidate_lua_dir}"
+    copy_module_lua_lib_if_exists "lua-resty-lrucache" "${candidate_lua_dir}"
+    copy_module_lua_lib_if_exists "lua-resty-http" "${candidate_lua_dir}"
 
     if [[ -f "${LUA_CPATH_DIR}/cjson.so" ]]; then
         cp -a "${LUA_CPATH_DIR}/cjson.so" "${candidate_lua_dir}/cjson.so"
@@ -1057,6 +1172,7 @@ EOF
     ldconfig
 }
 
+# ----- Nginx source patching and build ----------------------------------------
 escape_sed() {
     printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'
 }
@@ -1167,6 +1283,7 @@ build_and_install_nginx() {
     log_info "Candidate prefix: ${CANDIDATE_PREFIX}"
 }
 
+# ----- Config editing and validation ------------------------------------------
 replace_first_directive() {
     local file="$1"
     local key="$2"
@@ -1192,12 +1309,12 @@ replace_first_directive() {
         return 0
     fi
 
-    local rc=$?
+    local awk_exit_code=$?
     rm -f "${tmp}"
-    if [[ "${rc}" -eq 42 ]]; then
+    if [[ "${awk_exit_code}" -eq 42 ]]; then
         return 1
     fi
-    return "${rc}"
+    return "${awk_exit_code}"
 }
 
 ensure_line_in_http_block() {
@@ -1237,6 +1354,34 @@ has_active_log_format() {
     grep -Eq "^[[:space:]]*log_format[[:space:]]+${name}([[:space:]]|$)" "${file}"
 }
 
+lua_runtime_path_for_prefix() {
+    local prefix="$1"
+    printf '%s\n' "${LUA_SHARE_DIR}/?.lua;${LUA_SHARE_DIR}/?/init.lua;${prefix}/conf/lua/?.lua;${prefix}/conf/lua/?/init.lua;${prefix}/conf/waf/?.lua;${prefix}/conf/waf/?/init.lua;;"
+}
+
+lua_runtime_cpath_for_prefix() {
+    local prefix="$1"
+    printf '%s\n' "${LUA_CPATH_DIR}/?.so;${LUA_CPATH_DIR}/?/?.so;${prefix}/conf/lua/?.so;${prefix}/conf/lua/?/?.so;${LUAJIT_PREFIX}/lib/lua/5.1/?.so;${LUAJIT_PREFIX}/lib/lua/5.1/?/?.so;;"
+}
+
+lua_package_path_directive() {
+    printf 'lua_package_path "\\$prefix/conf/lua/?.lua;\\$prefix/conf/lua/?/init.lua;\\$prefix/conf/waf/?.lua;\\$prefix/conf/waf/?/init.lua;%s/?.lua;%s/?/init.lua;;";\n' "${LUA_SHARE_DIR}" "${LUA_SHARE_DIR}"
+}
+
+lua_package_cpath_directive() {
+    printf 'lua_package_cpath "\\$prefix/conf/lua/?.so;\\$prefix/conf/lua/?/?.so;%s/lib/lua/5.1/?.so;%s/lib/lua/5.1/?/?.so;%s/?.so;%s/?/?.so;;";\n' "${LUAJIT_PREFIX}" "${LUAJIT_PREFIX}" "${LUA_CPATH_DIR}" "${LUA_CPATH_DIR}"
+}
+
+upsert_http_directive() {
+    local conf_file="$1"
+    local key="$2"
+    local directive="$3"
+
+    if ! replace_first_directive "${conf_file}" "${key}" "    ${directive}"; then
+        ensure_line_in_http_block "${conf_file}" "${directive}"
+    fi
+}
+
 configure_nginx_conf() {
     local target_prefix="$1"
     phase "Configure nginx.conf"
@@ -1244,14 +1389,13 @@ configure_nginx_conf() {
     local conf_file="${target_prefix}/conf/nginx.conf"
     local main_format_line
     local json_format_line
-    local lua_package_path_line
-    local lua_package_cpath_line
+    local lua_package_path_line lua_package_cpath_line
     [[ -f "${conf_file}" ]] || die "nginx.conf not found: ${conf_file}"
 
     main_format_line="log_format main '\$remote_addr - \$remote_user [\$time_local] \"\$request\" \$status \$body_bytes_sent \"\$http_referer\" \"\$http_user_agent\" \"\$http_x_forwarded_for\"';"
     json_format_line="log_format json escape=json '{\"time\":\"\$time_iso8601\",\"remote_addr\":\"\$remote_addr\",\"x_forwarded_for\":\"\$http_x_forwarded_for\",\"request_id\":\"\$request_id\",\"remote_user\":\"\$remote_user\",\"request\":\"\$request\",\"status\":\$status,\"body_bytes_sent\":\$body_bytes_sent,\"request_time\":\$request_time,\"upstream_addr\":\"\$upstream_addr\",\"upstream_status\":\"\$upstream_status\",\"upstream_response_time\":\"\$upstream_response_time\",\"referer\":\"\$http_referer\",\"user_agent\":\"\$http_user_agent\",\"host\":\"\$host\",\"server_name\":\"\$server_name\",\"uri\":\"\$uri\",\"args\":\"\$args\"}';"
-    lua_package_path_line="lua_package_path \"\$prefix/conf/lua/?.lua;\$prefix/conf/lua/?/init.lua;\$prefix/conf/waf/?.lua;\$prefix/conf/waf/?/init.lua;${LUA_SHARE_DIR}/?.lua;${LUA_SHARE_DIR}/?/init.lua;;\";"
-    lua_package_cpath_line="lua_package_cpath \"\$prefix/conf/lua/?.so;\$prefix/conf/lua/?/?.so;${LUAJIT_PREFIX}/lib/lua/5.1/?.so;${LUAJIT_PREFIX}/lib/lua/5.1/?/?.so;${LUA_CPATH_DIR}/?.so;${LUA_CPATH_DIR}/?/?.so;;\";"
+    lua_package_path_line="$(lua_package_path_directive)"
+    lua_package_cpath_line="$(lua_package_cpath_directive)"
 
     mkdir -p "${LOG_DIR}"
     chown -R "${NGINX_USER}:${NGINX_GROUP}" "${LOG_DIR}"
@@ -1271,9 +1415,7 @@ configure_nginx_conf() {
     replace_first_directive "${conf_file}" "error_log" "error_log ${LOG_DIR}/error.log warn;" || \
         printf '%s\n' "error_log ${LOG_DIR}/error.log warn;" >> "${conf_file}"
 
-    if ! replace_first_directive "${conf_file}" "access_log" "    access_log ${LOG_DIR}/access.log json;"; then
-        ensure_line_in_http_block "${conf_file}" "access_log ${LOG_DIR}/access.log json;"
-    fi
+    upsert_http_directive "${conf_file}" "access_log" "access_log ${LOG_DIR}/access.log json;"
 
     if ! has_active_log_format "${conf_file}" "main"; then
         ensure_line_in_http_block "${conf_file}" "${main_format_line}"
@@ -1283,13 +1425,8 @@ configure_nginx_conf() {
         ensure_line_in_http_block "${conf_file}" "${json_format_line}"
     fi
 
-    if ! replace_first_directive "${conf_file}" "lua_package_path" "    ${lua_package_path_line}"; then
-        ensure_line_in_http_block "${conf_file}" "${lua_package_path_line}"
-    fi
-
-    if ! replace_first_directive "${conf_file}" "lua_package_cpath" "    ${lua_package_cpath_line}"; then
-        ensure_line_in_http_block "${conf_file}" "${lua_package_cpath_line}"
-    fi
+    upsert_http_directive "${conf_file}" "lua_package_path" "${lua_package_path_line}"
+    upsert_http_directive "${conf_file}" "lua_package_cpath" "${lua_package_cpath_line}"
 }
 
 integrate_waf() {
@@ -1301,7 +1438,15 @@ integrate_waf() {
     local waf_source="${WAF_EFFECTIVE_SOURCE_DIR}"
     local waf_lua_path_line
 
+    if [[ "${WAF_POLICY}" == "disabled" ]]; then
+        log_info "WAF policy disabled: skip waf integration."
+        return 0
+    fi
+
     if [[ -z "${waf_source}" || ! -d "${waf_source}" ]]; then
+        if [[ "${WAF_POLICY}" == "required" ]]; then
+            die "WAF source not found: ${waf_source:-<empty>}"
+        fi
         log_warn "waf source not found: ${waf_source:-<empty>} (skip)"
         return 0
     fi
@@ -1310,8 +1455,7 @@ integrate_waf() {
     cp -a "${waf_source}" "${waf_target}"
 
     if [[ -f "${waf_target}/waf.conf" ]]; then
-        waf_lua_path_line="lua_package_path \"\$prefix/conf/lua/?.lua;\$prefix/conf/lua/?/init.lua;\$prefix/conf/waf/?.lua;\$prefix/conf/waf/?/init.lua;${LUA_SHARE_DIR}/?.lua;${LUA_SHARE_DIR}/?/init.lua;;\";"
-        sed -i "s|/usr/local/openresty/nginx/conf|${NGINX_PREFIX}/conf|g" "${waf_target}/waf.conf"
+        waf_lua_path_line="$(lua_package_path_directive)"
         sed -i "s|/usr/local/nginx/conf|${NGINX_PREFIX}/conf|g" "${waf_target}/waf.conf"
         if ! replace_first_directive "${waf_target}/waf.conf" "lua_package_path" "${waf_lua_path_line}"; then
             if ! grep -Fq "${waf_lua_path_line}" "${waf_target}/waf.conf"; then
@@ -1320,7 +1464,6 @@ integrate_waf() {
         fi
     fi
     if [[ -f "${waf_target}/config.lua" ]]; then
-        sed -i "s|/usr/local/openresty/nginx/conf|${NGINX_PREFIX}/conf|g" "${waf_target}/config.lua"
         sed -i "s|/usr/local/nginx/conf|${NGINX_PREFIX}/conf|g" "${waf_target}/config.lua"
     fi
 
@@ -1336,8 +1479,8 @@ validate_nginx_conf() {
     local lua_path lua_cpath
     [[ -x "${nginx_bin}" ]] || die "nginx binary missing: ${nginx_bin}"
     [[ -f "${nginx_conf_abs}" ]] || die "nginx conf missing: ${nginx_conf_abs}"
-    lua_path="${LUA_SHARE_DIR}/?.lua;${LUA_SHARE_DIR}/?/init.lua;${target_prefix}/conf/lua/?.lua;${target_prefix}/conf/lua/?/init.lua;${target_prefix}/conf/waf/?.lua;${target_prefix}/conf/waf/?/init.lua;;"
-    lua_cpath="${LUA_CPATH_DIR}/?.so;${LUA_CPATH_DIR}/?/?.so;${target_prefix}/conf/lua/?.so;${target_prefix}/conf/lua/?/?.so;${LUAJIT_PREFIX}/lib/lua/5.1/?.so;${LUAJIT_PREFIX}/lib/lua/5.1/?/?.so;;"
+    lua_path="$(lua_runtime_path_for_prefix "${target_prefix}")"
+    lua_cpath="$(lua_runtime_cpath_for_prefix "${target_prefix}")"
     LUA_PATH="${lua_path}" LUA_CPATH="${lua_cpath}" \
         "${nginx_bin}" -t -q -p "${target_prefix}/" -c "${nginx_conf_rel}"
 }
@@ -1348,23 +1491,162 @@ validate_candidate() {
     log_info "Candidate validation passed: ${CANDIDATE_PREFIX}"
 }
 
-write_systemd_unit() {
-    local target_prefix="$1"
-    phase "Install systemd service"
+runtime_lua_path() {
+    local runtime_prefix="$1"
+    lua_runtime_path_for_prefix "${runtime_prefix}"
+}
+
+runtime_lua_cpath() {
+    local runtime_prefix="$1"
+    lua_runtime_cpath_for_prefix "${runtime_prefix}"
+}
+
+validate_runtime_conf_with_binary() {
+    local nginx_bin="$1"
+    local nginx_conf_rel="conf/nginx.conf"
+    local nginx_conf_abs="${RUNTIME_PREFIX}/${nginx_conf_rel}"
+    local lua_path lua_cpath
+
+    [[ -x "${nginx_bin}" ]] || die "nginx binary missing: ${nginx_bin}"
+    [[ -f "${nginx_conf_abs}" ]] || die "runtime nginx conf missing: ${nginx_conf_abs}"
+
+    lua_path="$(runtime_lua_path "${RUNTIME_PREFIX}")"
+    lua_cpath="$(runtime_lua_cpath "${RUNTIME_PREFIX}")"
+    LUA_PATH="${lua_path}" LUA_CPATH="${lua_cpath}" \
+        "${nginx_bin}" -t -q -p "${RUNTIME_PREFIX}/" -c "${nginx_conf_rel}"
+}
+
+# ----- Release publication and runtime deployment -----------------------------
+write_release_manifest() {
+    local release_dir="$1"
+    local manifest="${release_dir}/.release-manifest"
+    local bin="${release_dir}/sbin/nginx"
+    local cfg_args=""
+
+    if [[ -x "${bin}" ]]; then
+        cfg_args="$("${bin}" -V 2>&1 | sed -n 's/^configure arguments: //p' | head -n1)"
+    fi
+
+    cat > "${manifest}" <<EOF
+release_dir=${release_dir}
+built_at=$(date '+%Y-%m-%d %H:%M:%S')
+nginx_version=${NGINX_VERSION}
+openssl_version=${OPENSSL_VERSION}
+pcre2_version=${PCRE2_VERSION}
+jemalloc_version=${JEMALLOC_VERSION}
+libmaxminddb_version=${LIBMAXMINDDB_VERSION}
+waf_source_mode=${WAF_SOURCE_MODE}
+waf_policy=${WAF_POLICY}
+waf_source_path=${WAF_EFFECTIVE_SOURCE_DIR:-}
+configure_arguments=${cfg_args}
+EOF
+}
+
+publish_candidate_release() {
+    phase "Publish candidate as immutable release"
+
+    local ts release_name
+    ts="$(date +%Y%m%d%H%M%S)"
+    release_name="nginx-${NGINX_VERSION}-${ts}"
+    RELEASE_CANDIDATE_DIR="${RELEASES_DIR}/${release_name}"
+    if [[ -e "${RELEASE_CANDIDATE_DIR}" ]]; then
+        RELEASE_CANDIDATE_DIR="${RELEASE_CANDIDATE_DIR}-$$"
+    fi
+
+    mkdir -p "${RELEASES_DIR}"
+    cp -a "${CANDIDATE_PREFIX}" "${RELEASE_CANDIDATE_DIR}"
+    [[ -x "${RELEASE_CANDIDATE_DIR}/sbin/nginx" ]] || die "release binary missing: ${RELEASE_CANDIDATE_DIR}/sbin/nginx"
+    write_release_manifest "${RELEASE_CANDIDATE_DIR}"
+    log_info "Release published: ${RELEASE_CANDIDATE_DIR}"
+}
+
+bootstrap_runtime_conf_from_release() {
+    local release_dir="$1"
+    local runtime_conf="${RUNTIME_PREFIX}/conf"
+
+    mkdir -p "${RUNTIME_PREFIX}"
+    if [[ -f "${runtime_conf}/nginx.conf" ]]; then
+        log_info "Runtime nginx.conf already exists: ${runtime_conf}/nginx.conf (keep existing config)"
+        return 0
+    fi
+
+    [[ -d "${release_dir}/conf" ]] || die "release conf dir missing: ${release_dir}/conf"
+    cp -a "${release_dir}/conf" "${runtime_conf}"
+    log_info "Initialized runtime conf from release: ${runtime_conf}"
+}
+
+sync_runtime_lua_from_release() {
+    local release_dir="$1"
+    local src="${release_dir}/conf/lua"
+    local dst="${RUNTIME_PREFIX}/conf/lua"
+
+    if [[ ! -d "${src}" ]]; then
+        die "release lua runtime missing: ${src}"
+    fi
+    mkdir -p "${dst}"
+    cp -a "${src}/." "${dst}/"
+    log_info "Synced runtime Lua libs: ${dst}"
+}
+
+sync_runtime_waf_from_release() {
+    local release_dir="$1"
+    local src="${release_dir}/conf/waf"
+    local dst="${RUNTIME_PREFIX}/conf/waf"
+    local do_sync="${SYNC_WAF}"
+
+    if [[ "${WAF_POLICY}" == "disabled" ]]; then
+        return 0
+    fi
+    if [[ "${do_sync}" != "1" && -d "${dst}" ]]; then
+        log_info "Skip runtime waf sync (set --sync-waf to enable)."
+        return 0
+    fi
+
+    if [[ ! -d "${src}" ]]; then
+        if [[ "${WAF_POLICY}" == "required" ]]; then
+            die "release waf dir missing: ${src}"
+        fi
+        log_warn "release waf dir missing: ${src} (skip runtime waf sync)"
+        return 0
+    fi
+
+    if [[ -d "${dst}" ]]; then
+        local ts backup_dst
+        ts="$(date +%Y%m%d%H%M%S)"
+        backup_dst="${BACKUP_ROOT}/runtime-waf.${ts}.bak"
+        mkdir -p "${BACKUP_ROOT}"
+        cp -a "${dst}" "${backup_dst}"
+        log_info "Backed up runtime waf dir: ${backup_dst}"
+    fi
+
+    rm -rf "${dst}"
+    cp -a "${src}" "${dst}"
+    log_info "Synced runtime waf dir: ${dst}"
+}
+
+unit_uses_current_layout() {
+    local unit_file="$1"
+    [[ -f "${unit_file}" ]] || return 1
+    grep -Fq "${CURRENT_LINK}/sbin/nginx" "${unit_file}" || return 1
+    grep -Fq -- "-p ${RUNTIME_PREFIX}/" "${unit_file}" || return 1
+    grep -Fq -- "-c conf/nginx.conf" "${unit_file}" || return 1
+}
+
+write_systemd_unit_current_layout() {
+    phase "Install systemd service (current/runtime layout)"
 
     if ! command_exists systemctl; then
         log_warn "systemctl not found; skip systemd unit install."
         return 0
     fi
 
-    local nginx_bin="${target_prefix}/sbin/nginx"
+    local lua_path lua_cpath desc
+    local nginx_bin="${CURRENT_LINK}/sbin/nginx"
     local nginx_conf_rel="conf/nginx.conf"
-    local nginx_prefix_arg="${target_prefix}/"
-    local lua_path lua_cpath
-    local desc
-    desc="${TARGET_BRAND:-Nginx} source build"
-    lua_path="${LUA_SHARE_DIR}/?.lua;${LUA_SHARE_DIR}/?/init.lua;${target_prefix}/conf/lua/?.lua;${target_prefix}/conf/lua/?/init.lua;${target_prefix}/conf/waf/?.lua;${target_prefix}/conf/waf/?/init.lua;;"
-    lua_cpath="${LUA_CPATH_DIR}/?.so;${LUA_CPATH_DIR}/?/?.so;${target_prefix}/conf/lua/?.so;${target_prefix}/conf/lua/?/?.so;${LUAJIT_PREFIX}/lib/lua/5.1/?.so;${LUAJIT_PREFIX}/lib/lua/5.1/?/?.so;;"
+    local nginx_prefix_arg="${RUNTIME_PREFIX}/"
+    desc="${TARGET_BRAND:-Nginx} release layout"
+    lua_path="$(runtime_lua_path "${RUNTIME_PREFIX}")"
+    lua_cpath="$(runtime_lua_cpath "${RUNTIME_PREFIX}")"
 
     cat > "${SERVICE_UNIT_FILE}" <<EOF
 [Unit]
@@ -1401,24 +1683,66 @@ EOF
     systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
 }
 
-link_nginx_binary() {
-    phase "Link nginx into PATH"
-    ln -sf "${NGINX_PREFIX}/sbin/nginx" /usr/bin/nginx
+maybe_rewrite_current_layout_unit() {
+    SERVICE_UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+    SERVICE_UNIT_BACKUP="${BACKUP_ROOT}/${SERVICE_NAME}.service.$(date +%Y%m%d%H%M%S).bak"
+    HAD_SERVICE_UNIT=0
+    SERVICE_UNIT_CHANGED=0
+
+    if ! command_exists systemctl; then
+        return 0
+    fi
+
+    if [[ -f "${SERVICE_UNIT_FILE}" ]]; then
+        HAD_SERVICE_UNIT=1
+    fi
+
+    if [[ "${REWRITE_UNIT}" != "1" ]]; then
+        if [[ "${HAD_SERVICE_UNIT}" == "1" ]] && ! unit_uses_current_layout "${SERVICE_UNIT_FILE}"; then
+            die "Existing systemd unit does not use current/runtime layout. Re-run with --rewrite-unit or set REWRITE_UNIT=1."
+        fi
+        return 0
+    fi
+
+    mkdir -p "${BACKUP_ROOT}"
+    if [[ "${HAD_SERVICE_UNIT}" == "1" ]]; then
+        cp -a "${SERVICE_UNIT_FILE}" "${SERVICE_UNIT_BACKUP}"
+        log_info "Backed up systemd unit: ${SERVICE_UNIT_BACKUP}"
+    fi
+    write_systemd_unit_current_layout
+    SERVICE_UNIT_CHANGED=1
 }
 
-start_or_reload_nginx() {
-    local target_prefix="$1"
-    phase "Validate and start nginx"
-    local nginx_bin="${target_prefix}/sbin/nginx"
+switch_current_release() {
+    local target_release="$1"
+
+    [[ -d "${target_release}" ]] || die "target release not found: ${target_release}"
+    [[ -x "${target_release}/sbin/nginx" ]] || die "target release nginx missing: ${target_release}/sbin/nginx"
+
+    mkdir -p "$(dirname "${CURRENT_LINK}")"
+    if [[ -d "${CURRENT_LINK}" && ! -L "${CURRENT_LINK}" ]]; then
+        die "current link path exists as directory (expected symlink): ${CURRENT_LINK}"
+    fi
+
+    CURRENT_LINK_PREV_TARGET=""
+    if [[ -L "${CURRENT_LINK}" ]]; then
+        CURRENT_LINK_PREV_TARGET="$(readlink -f "${CURRENT_LINK}" 2>/dev/null || true)"
+    fi
+    ln -sfn "${target_release}" "${CURRENT_LINK}"
+    CURRENT_LINK_SWITCHED=1
+    log_info "Current release switched: ${CURRENT_LINK} -> ${target_release}"
+}
+
+start_or_reload_current_layout() {
+    phase "Validate and start nginx (current/runtime layout)"
+
+    local nginx_bin="${CURRENT_LINK}/sbin/nginx"
     local nginx_conf_rel="conf/nginx.conf"
     local lua_path lua_cpath
-    log_info "Service target: ${SERVICE_NAME}.service"
+    lua_path="$(runtime_lua_path "${RUNTIME_PREFIX}")"
+    lua_cpath="$(runtime_lua_cpath "${RUNTIME_PREFIX}")"
 
-    lua_path="${LUA_SHARE_DIR}/?.lua;${LUA_SHARE_DIR}/?/init.lua;${target_prefix}/conf/lua/?.lua;${target_prefix}/conf/lua/?/init.lua;${target_prefix}/conf/waf/?.lua;${target_prefix}/conf/waf/?/init.lua;;"
-    lua_cpath="${LUA_CPATH_DIR}/?.so;${LUA_CPATH_DIR}/?/?.so;${target_prefix}/conf/lua/?.so;${target_prefix}/conf/lua/?/?.so;${LUAJIT_PREFIX}/lib/lua/5.1/?.so;${LUAJIT_PREFIX}/lib/lua/5.1/?/?.so;;"
-
-    LUA_PATH="${lua_path}" LUA_CPATH="${lua_cpath}" \
-        "${nginx_bin}" -t -q -p "${target_prefix}/" -c "${nginx_conf_rel}"
+    validate_runtime_conf_with_binary "${nginx_bin}"
 
     if command_exists systemctl; then
         if systemctl is-active --quiet "${SERVICE_NAME}"; then
@@ -1429,91 +1753,117 @@ start_or_reload_nginx() {
     else
         if pgrep -x nginx >/dev/null 2>&1; then
             LUA_PATH="${lua_path}" LUA_CPATH="${lua_cpath}" \
-                "${nginx_bin}" -p "${target_prefix}/" -c "${nginx_conf_rel}" -s reload
+                "${nginx_bin}" -p "${RUNTIME_PREFIX}/" -c "${nginx_conf_rel}" -s reload
         else
             LUA_PATH="${lua_path}" LUA_CPATH="${lua_cpath}" \
-                "${nginx_bin}" -p "${target_prefix}/" -c "${nginx_conf_rel}"
+                "${nginx_bin}" -p "${RUNTIME_PREFIX}/" -c "${nginx_conf_rel}"
         fi
     fi
 }
 
-promote_candidate() {
-    phase "Promote candidate to live prefix"
+prune_old_releases() {
+    phase "Prune old releases"
+
+    local keep="${RELEASE_KEEP}"
+    local current_target=""
+    local index=0
+    local entry ts path
+    local -a sorted=()
+
+    [[ -d "${RELEASES_DIR}" ]] || return 0
+    current_target="$(readlink -f "${CURRENT_LINK}" 2>/dev/null || true)"
+
+    while IFS= read -r entry; do
+        ts="${entry%%	*}"
+        path="${entry#*	}"
+        [[ -d "${path}" ]] || continue
+        sorted+=("${path}")
+    done < <(
+        for path in "${RELEASES_DIR}"/*; do
+            [[ -d "${path}" ]] || continue
+            printf '%s\t%s\n' "$(stat -c %Y "${path}" 2>/dev/null || echo 0)" "${path}"
+        done | sort -rn
+    )
+
+    for path in "${sorted[@]:-}"; do
+        index=$((index + 1))
+        if (( index <= keep )); then
+            continue
+        fi
+        if [[ -n "${current_target}" && "${path}" == "${current_target}" ]]; then
+            continue
+        fi
+        rm -rf "${path}"
+        log_info "Pruned old release: ${path}"
+    done
+}
+
+deploy_release_layout() {
+    phase "Deploy release layout"
+
     mkdir -p "${BACKUP_ROOT}"
-    PROMOTE_TS="$(date +%Y%m%d%H%M%S)"
-    SERVICE_UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-    SERVICE_UNIT_BACKUP="${BACKUP_ROOT}/${SERVICE_NAME}.service.${PROMOTE_TS}.bak"
-    LIVE_PREFIX_BACKUP="${BACKUP_ROOT}/nginx-prefix.${PROMOTE_TS}.bak"
-    HAD_SERVICE_UNIT=0
-    HAD_LIVE_PREFIX=0
-    LIVE_PREFIX_MOVED=0
-    NEW_PREFIX_DEPLOYED=0
-    SERVICE_UNIT_CHANGED=0
+    mkdir -p "${RUNTIME_PREFIX}/conf"
+    UPGRADE_IN_PROGRESS=1
+    CURRENT_LINK_SWITCHED=0
+    CURRENT_LINK_PREV_TARGET=""
+    RELEASE_CANDIDATE_DIR=""
 
-    if [[ -f "${SERVICE_UNIT_FILE}" ]]; then
-        HAD_SERVICE_UNIT=1
-        cp -a "${SERVICE_UNIT_FILE}" "${SERVICE_UNIT_BACKUP}"
-        log_info "Backed up systemd unit: ${SERVICE_UNIT_BACKUP}"
+    publish_candidate_release
+
+    if [[ ! -f "${RUNTIME_PREFIX}/conf/nginx.conf" ]]; then
+        bootstrap_runtime_conf_from_release "${RELEASE_CANDIDATE_DIR}"
     fi
+    [[ -f "${RUNTIME_PREFIX}/conf/nginx.conf" ]] || die "runtime nginx.conf not found: ${RUNTIME_PREFIX}/conf/nginx.conf"
 
-    PROMOTE_IN_PROGRESS=1
-
-    if [[ -d "${NGINX_PREFIX}" ]]; then
-        HAD_LIVE_PREFIX=1
-        mv "${NGINX_PREFIX}" "${LIVE_PREFIX_BACKUP}"
-        LIVE_PREFIX_MOVED=1
-        log_info "Backed up live prefix: ${LIVE_PREFIX_BACKUP}"
-    fi
-
-    cp -a "${CANDIDATE_PREFIX}" "${NGINX_PREFIX}"
-    NEW_PREFIX_DEPLOYED=1
-    validate_nginx_conf "${NGINX_PREFIX}"
-    if command_exists systemctl; then
-        write_systemd_unit "${NGINX_PREFIX}"
-        SERVICE_UNIT_CHANGED=1
-    else
-        log_warn "systemctl not found; skip service unit update."
-    fi
+    sync_runtime_lua_from_release "${RELEASE_CANDIDATE_DIR}"
+    sync_runtime_waf_from_release "${RELEASE_CANDIDATE_DIR}"
+    validate_runtime_conf_with_binary "${RELEASE_CANDIDATE_DIR}/sbin/nginx"
+    maybe_rewrite_current_layout_unit
+    switch_current_release "${RELEASE_CANDIDATE_DIR}"
 
     if [[ "${LINK_NGINX_BIN}" == "1" ]]; then
-        link_nginx_binary
-    else
-        log_info "Skip /usr/bin/nginx relink (set --link-bin to enable)."
+        link_nginx_binary "${CURRENT_LINK}/sbin/nginx"
     fi
 
     if [[ "${ACTIVATE_SERVICE}" == "1" ]]; then
-        start_or_reload_nginx "${NGINX_PREFIX}"
+        start_or_reload_current_layout
     else
-        log_warn "Promotion completed without service activation. Use --activate to auto start/reload."
+        log_warn "Release switched without service activation. Use --activate to auto start/reload."
     fi
 
-    PROMOTE_IN_PROGRESS=0
-    log_info "Promotion finished. Backups retained in ${BACKUP_ROOT}"
+    UPGRADE_IN_PROGRESS=0
+    prune_old_releases
 }
 
+link_nginx_binary() {
+    local target="${1:-${NGINX_PREFIX}/sbin/nginx}"
+    phase "Link nginx into PATH"
+    ln -sf "${target}" /usr/bin/nginx
+}
+
+# ----- Reporting ---------------------------------------------------------------
 print_summary() {
     phase "Summary"
-    local summary_prefix="${CANDIDATE_PREFIX}"
-    if [[ "${INSTALL_MODE}" == "promote" ]]; then
-        summary_prefix="${NGINX_PREFIX}"
-    fi
-    echo "Install mode       : ${INSTALL_MODE}"
+    echo "Install profile    : release-layout"
     echo "Target prefix      : ${NGINX_PREFIX}"
-    echo "Candidate prefix   : ${CANDIDATE_PREFIX}"
-    echo "Config file        : ${summary_prefix}/conf/nginx.conf"
+    echo "Candidate prefix   : ${CANDIDATE_PREFIX:-<none>}"
+    echo "Runtime prefix     : ${RUNTIME_PREFIX}"
+    echo "Releases dir       : ${RELEASES_DIR}"
+    echo "Current link       : ${CURRENT_LINK}"
+    echo "Runtime config     : ${RUNTIME_PREFIX}/conf/nginx.conf"
     echo "PID file           : ${PID_FILE}"
     echo "Log dir            : ${LOG_DIR}"
     echo "WAF source mode    : ${WAF_SOURCE_MODE}"
+    echo "WAF policy         : ${WAF_POLICY}"
     echo "WAF source path    : ${WAF_EFFECTIVE_SOURCE_DIR:-<none>}"
     if [[ "${WAF_SOURCE_MODE}" == "online" ]]; then
         echo "WAF repo           : ${WAF_REPO_URL}"
         echo "WAF repo ref       : ${WAF_REPO_REF:-<default branch>}"
         echo "WAF repo subdir    : ${WAF_REPO_SUBDIR}"
     fi
-    echo "WAF dir            : ${summary_prefix}/conf/waf"
+    echo "WAF dir (runtime)  : ${RUNTIME_PREFIX}/conf/waf"
     echo "Service name       : ${SERVICE_NAME}"
     echo "Backup root        : ${BACKUP_ROOT}"
-    echo "OpenResty prefix   : ${OPENRESTY_PREFIX_DETECTED:-<not detected>}"
     echo ""
     echo "Modules            :"
     echo "  - ngx_devel_kit"
@@ -1522,26 +1872,38 @@ print_summary() {
     echo "  - ngx_http_geoip2_module"
     echo "  - ngx_http_substitutions_filter_module"
     echo ""
-    local cand_bin="${CANDIDATE_PREFIX}/sbin/nginx"
-    if [[ -x "${cand_bin}" ]]; then
-        "${cand_bin}" -V 2>&1 | sed 's/^/  /'
+    local info_bin=""
+    if [[ -x "${CANDIDATE_PREFIX}/sbin/nginx" ]]; then
+        info_bin="${CANDIDATE_PREFIX}/sbin/nginx"
+    elif [[ -x "${CURRENT_LINK}/sbin/nginx" ]]; then
+        info_bin="${CURRENT_LINK}/sbin/nginx"
     fi
-    if [[ "${INSTALL_MODE}" == "stage" ]]; then
-        echo ""
-        echo "Next step:"
-        echo "  Re-run with --promote (and optionally --activate) after candidate verification."
+    if [[ -n "${info_bin}" ]]; then
+        "${info_bin}" -V 2>&1 | sed 's/^/  /'
+    fi
+    echo ""
+    echo "Next step:"
+    if [[ "${ACTIVATE_SERVICE}" == "1" ]]; then
+        echo "  Verify service/runtime health and application routes."
+    else
+        echo "  Manual check before restart: nginx -t with runtime config, then restart/reload when ready."
     fi
 }
 
 print_dry_run_plan() {
     phase "Dry-run execution plan"
-    echo "Mode              : ${INSTALL_MODE}"
+    echo "Install profile   : release-layout"
     echo "Dry run           : ${DRY_RUN}"
     echo "Target prefix     : ${NGINX_PREFIX}"
+    echo "Runtime prefix    : ${RUNTIME_PREFIX}"
+    echo "Releases dir      : ${RELEASES_DIR}"
+    echo "Current link      : ${CURRENT_LINK}"
+    echo "Release keep      : ${RELEASE_KEEP}"
     echo "Service name      : ${SERVICE_NAME}"
     echo "Backup root       : ${BACKUP_ROOT}"
-    echo "OpenResty prefix  : ${OPENRESTY_PREFIX_DETECTED:-<not detected>}"
     echo "WAF source mode   : ${WAF_SOURCE_MODE}"
+    echo "WAF policy        : ${WAF_POLICY}"
+    echo "Sync WAF          : ${SYNC_WAF}"
     if [[ "${WAF_SOURCE_MODE}" == "local" ]]; then
         echo "WAF source dir    : ${WAF_EFFECTIVE_SOURCE_DIR:-${WAF_SOURCE_DIR}}"
     else
@@ -1552,12 +1914,13 @@ print_dry_run_plan() {
     echo "Auto latest       : ${AUTO_LATEST}"
     echo "Activate service  : ${ACTIVATE_SERVICE}"
     echo "Link /usr/bin/nginx: ${LINK_NGINX_BIN}"
+    echo "Rewrite unit      : ${REWRITE_UNIT}"
     echo ""
     echo "Planned steps:"
     echo "  1) Detect OS and install build dependencies"
     echo "  2) Resolve dependency versions (Nginx/OpenSSL/PCRE2/jemalloc/libmaxminddb)"
     echo "  3) Download sources and modules"
-    if [[ "${WAF_SOURCE_MODE}" == "online" ]]; then
+    if [[ "${WAF_SOURCE_MODE}" == "online" && "${WAF_POLICY}" != "disabled" ]]; then
         echo "  4) Fetch online WAF repo (${WAF_REPO_URL}) and locate ${WAF_REPO_SUBDIR}/"
         echo "  5) Build candidate nginx under workdir (DESTDIR install)"
         echo "  6) Patch candidate nginx.conf and integrate waf/"
@@ -1567,38 +1930,29 @@ print_dry_run_plan() {
         echo "  5) Patch candidate nginx.conf and integrate waf/"
         echo "  6) Validate candidate with nginx -t"
     fi
-    if [[ "${INSTALL_MODE}" == "promote" ]]; then
-        if [[ "${WAF_SOURCE_MODE}" == "online" ]]; then
-            echo "  8) Backup current live prefix + systemd unit"
-            echo "  9) Promote candidate to ${NGINX_PREFIX}"
-            echo "  10) Validate promoted config and optionally activate service"
-            echo "  11) Roll back automatically on promotion failure"
-        else
-            echo "  7) Backup current live prefix + systemd unit"
-            echo "  8) Promote candidate to ${NGINX_PREFIX}"
-            echo "  9) Validate promoted config and optionally activate service"
-            echo "  10) Roll back automatically on promotion failure"
-        fi
+    echo "  7+) Publish candidate to immutable release under ${RELEASES_DIR}"
+    echo "  8+) Initialize runtime config only if missing at ${RUNTIME_PREFIX}/conf/nginx.conf"
+    echo "  9+) Sync runtime Lua assets and optional WAF assets under ${RUNTIME_PREFIX}/conf"
+    echo "  10+) Validate runtime config with new release binary"
+    echo "  11+) Switch ${CURRENT_LINK} to new release"
+    if [[ "${ACTIVATE_SERVICE}" == "1" ]]; then
+        echo "  12+) Start/reload service automatically"
     else
-        if [[ "${WAF_SOURCE_MODE}" == "online" ]]; then
-            echo "  8) Stop at staged candidate (live service untouched)"
-        else
-            echo "  7) Stop at staged candidate (live service untouched)"
-        fi
+        echo "  12+) Keep service untouched for manual verification/restart"
     fi
+    echo "  13+) Prune old releases, keeping newest ${RELEASE_KEEP}"
 }
 
-main() {
-    parse_args "$@"
-    safety_guard
-    detect_os
-    resolve_versions
+# ----- Orchestration -----------------------------------------------------------
+run_dry_run_flow() {
     resolve_waf_source
     resolve_brand
-    if [[ "${DRY_RUN}" == "1" ]]; then
-        print_dry_run_plan
-        return 0
-    fi
+    print_dry_run_plan
+}
+
+run_install_flow() {
+    resolve_waf_source
+    resolve_brand
     ensure_root
     install_build_deps
     prepare_workspace
@@ -1618,12 +1972,22 @@ main() {
     configure_nginx_conf "${CANDIDATE_PREFIX}"
     integrate_waf "${CANDIDATE_PREFIX}"
     validate_candidate
-    if [[ "${INSTALL_MODE}" == "promote" ]]; then
-        promote_candidate
-    else
-        log_info "Stage mode finished. Live prefix/service untouched."
-    fi
+    deploy_release_layout
     print_summary
+}
+
+main() {
+    parse_args "$@"
+    safety_guard
+    detect_os
+    resolve_versions
+
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        run_dry_run_flow
+        return 0
+    fi
+
+    run_install_flow
 }
 
 main "$@"
