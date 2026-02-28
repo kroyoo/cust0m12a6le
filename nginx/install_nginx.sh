@@ -1962,7 +1962,11 @@ WantedBy=multi-user.target
 EOF
 
     if command_exists systemd-analyze; then
-        systemd-analyze verify "${SERVICE_UNIT_FILE}" >/dev/null
+        if [[ -x "${nginx_bin}" ]]; then
+            systemd-analyze verify "${SERVICE_UNIT_FILE}" >/dev/null
+        else
+            log_warn "Skip systemd-analyze verify: nginx binary not ready yet (${nginx_bin})"
+        fi
     fi
 
     systemctl daemon-reload
@@ -2105,8 +2109,8 @@ deploy_release_layout() {
     sync_runtime_lua_from_release "${RELEASE_CANDIDATE_DIR}"
     sync_runtime_waf_from_release "${RELEASE_CANDIDATE_DIR}"
     validate_runtime_conf_with_binary "${RELEASE_CANDIDATE_DIR}/sbin/nginx"
-    maybe_rewrite_current_layout_unit
     switch_current_release "${RELEASE_CANDIDATE_DIR}"
+    maybe_rewrite_current_layout_unit
 
     if [[ "${LINK_NGINX_BIN}" == "1" ]]; then
         link_nginx_binary "${CURRENT_LINK}/sbin/nginx"
