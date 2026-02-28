@@ -1525,11 +1525,11 @@ lua_runtime_cpath_for_prefix() {
 }
 
 lua_package_path_directive() {
-    printf 'lua_package_path "\\$prefix/conf/lua/?.lua;\\$prefix/conf/lua/?/init.lua;\\$prefix/conf/waf/?.lua;\\$prefix/conf/waf/?/init.lua;%s/?.lua;%s/?/init.lua;;";\n' "${LUA_SHARE_DIR}" "${LUA_SHARE_DIR}"
+    printf 'lua_package_path "$prefix/conf/lua/?.lua;$prefix/conf/lua/?/init.lua;$prefix/conf/waf/?.lua;$prefix/conf/waf/?/init.lua;%s/?.lua;%s/?/init.lua;;";\n' "${LUA_SHARE_DIR}" "${LUA_SHARE_DIR}"
 }
 
 lua_package_cpath_directive() {
-    printf 'lua_package_cpath "\\$prefix/conf/lua/?.so;\\$prefix/conf/lua/?/?.so;%s/lib/lua/5.1/?.so;%s/lib/lua/5.1/?/?.so;%s/?.so;%s/?/?.so;;";\n' "${LUAJIT_PREFIX}" "${LUAJIT_PREFIX}" "${LUA_CPATH_DIR}" "${LUA_CPATH_DIR}"
+    printf 'lua_package_cpath "$prefix/conf/lua/?.so;$prefix/conf/lua/?/?.so;%s/lib/lua/5.1/?.so;%s/lib/lua/5.1/?/?.so;%s/?.so;%s/?/?.so;;";\n' "${LUAJIT_PREFIX}" "${LUAJIT_PREFIX}" "${LUA_CPATH_DIR}" "${LUA_CPATH_DIR}"
 }
 
 upsert_http_directive() {
@@ -1587,8 +1587,8 @@ configure_nginx_conf() {
     local lua_package_path_line lua_package_cpath_line
     [[ -f "${conf_file}" ]] || die "nginx.conf not found: ${conf_file}"
 
-    main_format_line="log_format main '\$remote_addr - \$remote_user [\$time_local] \"\$request\" \$status \$body_bytes_sent \"\$http_referer\" \"\$http_user_agent\" \"\$http_x_forwarded_for\"';"
-    json_format_line="log_format json escape=json '{\"time\":\"\$time_iso8601\",\"remote_addr\":\"\$remote_addr\",\"x_forwarded_for\":\"\$http_x_forwarded_for\",\"request_id\":\"\$request_id\",\"remote_user\":\"\$remote_user\",\"request\":\"\$request\",\"status\":\$status,\"body_bytes_sent\":\$body_bytes_sent,\"request_time\":\$request_time,\"upstream_addr\":\"\$upstream_addr\",\"upstream_status\":\"\$upstream_status\",\"upstream_response_time\":\"\$upstream_response_time\",\"referer\":\"\$http_referer\",\"user_agent\":\"\$http_user_agent\",\"host\":\"\$host\",\"server_name\":\"\$server_name\",\"uri\":\"\$uri\",\"args\":\"\$args\"}';"
+    main_format_line='log_format main '"'"'$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" "$http_x_forwarded_for"'"'"';'
+    json_format_line='log_format json escape=json '"'"'{"time":"$time_iso8601","remote_addr":"$remote_addr","x_forwarded_for":"$http_x_forwarded_for","request_id":"$request_id","remote_user":"$remote_user","request":"$request","status":$status,"body_bytes_sent":$body_bytes_sent,"request_time":$request_time,"upstream_addr":"$upstream_addr","upstream_status":"$upstream_status","upstream_response_time":"$upstream_response_time","referer":"$http_referer","user_agent":"$http_user_agent","host":"$host","server_name":"$server_name","uri":"$uri","args":"$args"}'"'"';'
     lua_package_path_line="$(lua_package_path_directive)"
     lua_package_cpath_line="$(lua_package_cpath_directive)"
 
@@ -2100,6 +2100,7 @@ deploy_release_layout() {
         bootstrap_runtime_conf_from_release "${RELEASE_CANDIDATE_DIR}"
     fi
     [[ -f "${RUNTIME_PREFIX}/conf/nginx.conf" ]] || die "runtime nginx.conf not found: ${RUNTIME_PREFIX}/conf/nginx.conf"
+    mkdir -p "${RUNTIME_PREFIX}/logs"
 
     sync_runtime_lua_from_release "${RELEASE_CANDIDATE_DIR}"
     sync_runtime_waf_from_release "${RELEASE_CANDIDATE_DIR}"

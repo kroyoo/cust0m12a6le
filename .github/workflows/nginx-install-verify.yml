@@ -31,7 +31,8 @@ jobs:
             -y \
             --auto-latest 0 \
             --brand Fungit \
-            --no-rewrite-unit \
+            --rewrite-unit \
+            --activate \
             --waf-policy optional \
             --sync-waf \
             2>&1 | tee /tmp/nginx-ci-logs/install.log
@@ -46,6 +47,40 @@ jobs:
           sudo test -f /usr/local/nginx-data/conf/nginx.conf
           sudo test -f /usr/local/nginx-data/conf/lua/resty/http.lua
           sudo test -f /usr/local/nginx-data/conf/waf/waf.conf
+
+      - name: Verify systemctl service lifecycle
+        shell: bash
+        run: |
+          set -euxo pipefail
+          command -v systemctl >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart nginx
+          sudo systemctl status nginx --no-pager -l | tee /tmp/nginx-ci-logs/systemctl-status.log
+          sudo systemctl is-active nginx | tee /tmp/nginx-ci-logs/systemctl-active.log
+
+      - name: Show nginx directory layout
+        shell: bash
+        run: |
+          set -euxo pipefail
+          {
+            echo "==== /usr/local/nginx ===="
+            sudo ls -lah /usr/local/nginx
+            echo
+            echo "==== /usr/local/nginx/releases ===="
+            sudo ls -lah /usr/local/nginx/releases
+            echo
+            echo "==== /usr/local/nginx/current ===="
+            sudo ls -lah /usr/local/nginx/current
+            echo
+            echo "==== /usr/local/nginx-data ===="
+            sudo ls -lah /usr/local/nginx-data
+            echo
+            echo "==== /usr/local/nginx-data/conf ===="
+            sudo ls -lah /usr/local/nginx-data/conf
+            echo
+            echo "==== Tree (/usr/local/nginx-data, depth<=3) ===="
+            sudo find /usr/local/nginx-data -maxdepth 3 -mindepth 1 -print | sort
+          } | tee /tmp/nginx-ci-logs/nginx-layout.log
 
       - name: Upload install logs
         if: always()
