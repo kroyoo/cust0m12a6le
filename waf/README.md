@@ -5,7 +5,7 @@ Lua WAF for `lua-nginx-module`, refactored as modular components.
 ## Nginx include
 
 ```nginx
-include conf/waf/waf.conf;
+include waf/waf.conf;
 ```
 
 `waf.conf` contains:
@@ -13,7 +13,7 @@ include conf/waf/waf.conf;
 ```nginx
 lua_shared_dict limit 20m;
 lua_shared_dict waf_challenge 20m;
-lua_package_path "conf/waf/?.lua;;";
+lua_package_path "$prefix/conf/lua/?.lua;$prefix/conf/lua/?/init.lua;$prefix/conf/waf/?.lua;$prefix/conf/waf/?/init.lua;;";
 init_by_lua_file "conf/waf/init.lua";
 access_by_lua_file "conf/waf/access.lua";
 ```
@@ -42,11 +42,44 @@ Rule directory: `conf/waf/wafconf` (resolved from Nginx prefix).
 - `args`, `cookie`, `post`
 - `useragent`, `tencent_useragent`
 
+`whitereferer` rule format:
+
+- one regex per line, matched against full `Referer` header value
+- example:
+  - `^https?://(?:[a-z0-9-]+\.)*fri\.com(?::\d+)?(?:[/?#].*)?$`
+
 IP rule format (`whiteip` / `blackip`):
 
 - exact IP: `203.0.113.10`
 - CIDR: `203.0.113.0/24`
 - regex: `^198\.51\.100\.\d+$`
+
+## Rule Reload Behavior
+
+- Rule files under `wafconf/` are loaded from disk and cached for `cache.rule_ttl` seconds (default `30`).
+- Editing `whiteurl`/`blackurl`/`args`/`post` and other rule files may not be visible immediately on active workers.
+- For immediate effect after rule edits:
+  - `nginx -s reload`
+- If you do not reload, wait for cache TTL to expire.
+- Editing `config.lua` always requires reload.
+
+## Protection Flow Order
+
+Runtime order in `engine.lua`:
+
+1. Handle challenge page/verify endpoints first (`/captcha-waf.html`, `/captcha-waf/verify` by default).
+2. Enforce existing challenge lock before normal detection checks.
+3. Run the configured detection pipeline (`config.lua -> pipeline`).
+
+Default pipeline order:
+
+- `black_ip` -> `white_ip` -> `white_referer` -> `white_url` -> `user_agent` -> `cc` -> `cookie` -> `url` -> `url_args` -> `post`
+
+Operational implications:
+
+- `black_ip` has higher priority than `white_ip` because it runs first.
+- `white_referer` and `white_url` only take effect when their switches are enabled.
+- `white_url` does not apply when request URI contains query string.
 
 ## Notes
 
@@ -87,14 +120,74 @@ Edit only `config.lua` for operational tuning:
 When `cc.action = "captcha"`:
 
 1. Set `challenge.secret` to a random 32+ byte value.
+   - example: `openssl rand -hex 32`
 2. Keep `lua_shared_dict waf_challenge 20m;` in `waf.conf`.
-3. Select provider:
-   - `turnstile`: set `challenge.provider = "turnstile"` and configure `challenge.turnstile.site_key` + `challenge.turnstile.secret_key`.
-   - `native`: set `challenge.provider = "native"` as internal fallback.
-   - `turnstile` requires `lua-resty-http` and outbound HTTPS to Cloudflare verify endpoint.
-4. If needed, customize routes:
-   - `route.captcha_uri`
-   - `route.captcha_verify_uri`
+3. Choose challenge provider:
+   - `native`: internal fallback challenge, no third-party key needed.
+   - `turnstile`: Cloudflare challenge, requires `site_key` and `secret_key`.
+4. Get Cloudflare Turnstile keys:
+   - login to Cloudflare dashboard (`dash.cloudflare.com`)
+   - open `Turnstile`
+   - create/add a site
+   - set allowed hostnames (include your production domain; add subdomains if needed)
+   - copy generated `Site Key` and `Secret Key`
+5. Configure `config.lua` for Turnstile:
+
+```lua
+-- cc mode must be captcha
+C.cc.action = "captcha"
+
+C.challenge.enabled = true
+C.challenge.provider = "turnstile"
+C.challenge.secret = "replace_with_random_32B_or_longer_secret"
+
+C.challenge.turnstile.site_key = "replace_with_cf_site_key"
+C.challenge.turnstile.secret_key = "replace_with_cf_secret_key"
+-- usually keep default:
+-- C.challenge.turnstile.verify_url = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+```
+
+6. Verify runtime requirements:
+   - `lua-resty-http` is installed (used by server-side verify call)
+   - server can access `https://challenges.cloudflare.com/turnstile/v0/siteverify` via outbound HTTPS
+7. Reload Nginx and validate:
+   - `nginx -t && nginx -s reload`
+   - trigger captcha flow and ensure challenge page renders
+   - submit challenge and confirm redirect back to original URL
+
+Notes:
+
+- If `turnstile` keys are missing/empty, runtime auto-falls back to `native`.
+- `verify_url` usually does not need to be changed.
+- Turnstile hostname allow-list is domain-based; request path differences do not require extra key config.
+
+## Runtime Diagnostics
+
+Use these checks when challenge behavior is not as expected:
+
+```bash
+# 1) Ensure waf include exists in final nginx.conf
+grep -n "include waf/waf.conf;" /usr/local/nginx/conf/nginx.conf
+
+# 2) Ensure WAF challenge route config is loaded
+grep -n "captcha_uri\\|captcha_verify_uri\\|provider\\|secret_key\\|site_key" /usr/local/nginx/conf/waf/config.lua
+
+# 3) Ensure resty.http is available to runtime
+ls -l /usr/local/share/lua/5.1/resty/http.lua
+ls -l /usr/local/nginx/conf/lua/resty/http.lua
+
+# 4) Ensure service has LUA_PATH
+systemctl cat nginx | grep LUA_PATH
+
+# 5) Ensure outbound HTTPS to Turnstile verify endpoint
+curl -I https://challenges.cloudflare.com/turnstile/v0/siteverify
+
+# 6) Check rule cache TTL and current challenge/cc mode
+grep -n "rule_ttl\\|cc.action\\|provider\\|fail_open" /usr/local/nginx/conf/waf/config.lua
+
+# 7) Check security event logs (if log.mode=file)
+tail -n 50 /data/wwwlogs/$(date +%F)_sec.log
+```
 
 ## Runtime Self-Test
 
@@ -108,6 +201,13 @@ PROBE_URI="/robots.txt?__waf_probe=1" \
 CC_BURST_MAX=80 \
 conf/waf/selftest_challenge.sh
 ```
+
+Optional self-test overrides:
+
+- `CONTINUE_PARAM` (default: `continue`)
+- `PASS_COOKIE_NAME` (default: `__waf_pass`)
+- `CURL_TIMEOUT` / `CURL_CONNECT_TIMEOUT`
+- `TLS_INSECURE` (`1` to use `-k`, default `1`)
 
 It validates:
 
