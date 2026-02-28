@@ -22,7 +22,7 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git
 
-      - name: Run nginx installer (with logs)
+      - name: Install baseline nginx (with logs)
         shell: bash
         run: |
           set -euxo pipefail
@@ -30,12 +30,77 @@ jobs:
           sudo bash nginx/install_nginx.sh \
             -y \
             --auto-latest 0 \
-            --brand Fungit \
+            --nginx-version 1.28.0 \
+            --brand devtest \
             --rewrite-unit \
             --activate \
             --waf-policy optional \
             --sync-waf \
-            2>&1 | tee /tmp/nginx-ci-logs/install.log
+            2>&1 | tee /tmp/nginx-ci-logs/install-baseline.log
+
+      - name: Verify baseline release and brand
+        shell: bash
+        run: |
+          set -euxo pipefail
+          baseline_release="$(sudo readlink -f /usr/local/nginx/current)"
+          echo "baseline_release=${baseline_release}" | tee /tmp/nginx-ci-logs/nginx-baseline-release.log
+          basename "${baseline_release}" | grep -E '^nginx-1\.28\.0-'
+          sudo test -f "${baseline_release}/.release-manifest"
+          sudo grep -Fx "nginx_version=1.28.0" "${baseline_release}/.release-manifest"
+          sudo /usr/local/nginx/current/sbin/nginx -v 2>&1 | tee /tmp/nginx-ci-logs/nginx-version-baseline.log
+          sudo /usr/local/nginx/current/sbin/nginx -v 2>&1 | grep -F "devtest"
+
+      - name: Verify systemctl after baseline install
+        shell: bash
+        run: |
+          set -euxo pipefail
+          command -v systemctl >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl is-active nginx | tee /tmp/nginx-ci-logs/systemctl-active-baseline.log
+          sudo systemctl status nginx --no-pager -l | tee /tmp/nginx-ci-logs/systemctl-status-baseline.log
+          sudo systemctl restart nginx
+          sudo systemctl is-active nginx | tee -a /tmp/nginx-ci-logs/systemctl-active-baseline.log
+
+      - name: Verify update-waf-only flow
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo bash nginx/install_nginx.sh \
+            -y \
+            --update-waf-only \
+            --waf-policy required \
+            --waf-repo https://github.com/kroyoo/cust0m12a6le.git \
+            --waf-ref main \
+            --waf-subdir waf \
+            2>&1 | tee /tmp/nginx-ci-logs/update-waf-only.log
+          grep -F "WAF update-only flow completed." /tmp/nginx-ci-logs/update-waf-only.log
+
+      - name: Verify version upgrade flow
+        shell: bash
+        run: |
+          set -euxo pipefail
+          before_release="$(sudo readlink -f /usr/local/nginx/current)"
+          echo "before_release=${before_release}" | tee /tmp/nginx-ci-logs/upgrade-summary.log
+
+          sudo bash nginx/install_nginx.sh \
+            -y \
+            --auto-latest 0 \
+            --nginx-version 1.28.2 \
+            --brand devtest \
+            --rewrite-unit \
+            --activate \
+            --waf-policy optional \
+            --sync-waf \
+            2>&1 | tee /tmp/nginx-ci-logs/install-upgrade.log
+
+          after_release="$(sudo readlink -f /usr/local/nginx/current)"
+          echo "after_release=${after_release}" | tee -a /tmp/nginx-ci-logs/upgrade-summary.log
+          test "${before_release}" != "${after_release}"
+          basename "${after_release}" | grep -E '^nginx-1\.28\.2-'
+          sudo test -f "${after_release}/.release-manifest"
+          sudo grep -Fx "nginx_version=1.28.2" "${after_release}/.release-manifest"
+          sudo /usr/local/nginx/current/sbin/nginx -v 2>&1 | tee /tmp/nginx-ci-logs/nginx-version-upgrade.log
+          sudo /usr/local/nginx/current/sbin/nginx -v 2>&1 | grep -F "devtest"
 
       - name: Verify nginx binary and runtime config
         shell: bash
@@ -48,7 +113,7 @@ jobs:
           sudo test -f /usr/local/nginx-data/conf/lua/resty/http.lua
           sudo test -f /usr/local/nginx-data/conf/waf/waf.conf
 
-      - name: Verify systemctl service lifecycle
+      - name: Verify systemctl service lifecycle after upgrade
         shell: bash
         run: |
           set -euxo pipefail
@@ -68,6 +133,9 @@ jobs:
             echo
             echo "==== /usr/local/nginx/releases ===="
             sudo ls -lah /usr/local/nginx/releases
+            echo
+            echo "==== Tree (/usr/local/nginx/releases, depth<=3) ===="
+            sudo find /usr/local/nginx/releases -maxdepth 3 -mindepth 1 -print | sort
             echo
             echo "==== /usr/local/nginx/current ===="
             sudo ls -lah /usr/local/nginx/current
