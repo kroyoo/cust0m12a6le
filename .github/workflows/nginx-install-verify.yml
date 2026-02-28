@@ -1,4 +1,4 @@
-name: Debian Nginx Installer Verify
+name: Ubuntu Nginx Installer Verify
 
 on:
   workflow_dispatch:
@@ -7,33 +7,30 @@ on:
 
 jobs:
   install-and-verify:
-    name: Install and verify on Debian 12
+    name: Install and verify on Ubuntu
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    container:
-      image: debian:12
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare Debian base tools
+      - name: Prepare Ubuntu base tools
         shell: bash
         run: |
           set -euxo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git
 
       - name: Run nginx installer (with logs)
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p /tmp/nginx-ci-logs
-          bash nginx/install_nginx.sh \
+          sudo bash nginx/install_nginx.sh \
             -y \
             --auto-latest 0 \
-            --no-brand \
+            --brand Fungit \
             --no-rewrite-unit \
             --waf-policy optional \
             --sync-waf \
@@ -43,18 +40,17 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          /usr/local/nginx/current/sbin/nginx -V 2>&1 | tee /tmp/nginx-ci-logs/nginx-v.log
-          /usr/local/nginx/current/sbin/nginx -t -p /usr/local/nginx-data/ -c conf/nginx.conf \
+          sudo /usr/local/nginx/current/sbin/nginx -V 2>&1 | tee /tmp/nginx-ci-logs/nginx-v.log
+          sudo /usr/local/nginx/current/sbin/nginx -t -p /usr/local/nginx-data/ -c conf/nginx.conf \
             2>&1 | tee /tmp/nginx-ci-logs/nginx-t.log
-          test -f /usr/local/nginx-data/conf/nginx.conf
-          test -f /usr/local/nginx-data/conf/lua/resty/http.lua
-          test -f /usr/local/nginx-data/conf/waf/waf.conf
+          sudo test -f /usr/local/nginx-data/conf/nginx.conf
+          sudo test -f /usr/local/nginx-data/conf/lua/resty/http.lua
+          sudo test -f /usr/local/nginx-data/conf/waf/waf.conf
 
       - name: Upload install logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nginx-install-logs-debian12
+          name: nginx-install-logs-ubuntu
           path: /tmp/nginx-ci-logs/
           if-no-files-found: warn
-

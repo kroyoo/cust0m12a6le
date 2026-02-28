@@ -1746,14 +1746,15 @@ bootstrap_runtime_conf_from_release() {
     local release_dir="$1"
     local runtime_conf="${RUNTIME_PREFIX}/conf"
 
-    mkdir -p "${RUNTIME_PREFIX}"
+    mkdir -p "${runtime_conf}"
     if [[ -f "${runtime_conf}/nginx.conf" ]]; then
         log_info "Runtime nginx.conf already exists: ${runtime_conf}/nginx.conf (keep existing config)"
         return 0
     fi
 
     [[ -d "${release_dir}/conf" ]] || die "release conf dir missing: ${release_dir}/conf"
-    cp -a "${release_dir}/conf" "${runtime_conf}"
+    cp -a "${release_dir}/conf/." "${runtime_conf}/"
+    [[ -f "${runtime_conf}/nginx.conf" ]] || die "Runtime bootstrap failed: ${runtime_conf}/nginx.conf missing after copy"
     log_info "Initialized runtime conf from release: ${runtime_conf}"
 }
 
