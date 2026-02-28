@@ -9,6 +9,7 @@ Source installer for Nginx + Lua WAF + GeoIP2 modules (single release-layout wor
 - Switches active binary by updating `current` symlink.
 - Keeps runtime config persistent in separate runtime prefix (no full prefix replacement).
 - Default behavior does **not** auto-restart service; you can verify first, then restart manually.
+- Supports WAF hot update mode (`--update-waf-only`) without compile/build steps.
 
 ## Release Layout
 
@@ -57,12 +58,32 @@ Optional runtime WAF sync:
 
 - `--sync-waf` / `--no-sync-waf`
 
+## Network Reliability (GitHub Timeout Mitigation)
+
+For servers in mainland China, you can inject proxy and mirror gateway globally:
+
+- `--proxy-url URL`: export `http_proxy/https_proxy/all_proxy` for current script process.
+- `--github-mirror-gateway URL`: one option for both git clone and GitHub download URLs.
+- `--git-mirror-gateway URL`: mirror gateway used by `clone_repo_once`.
+- `--download-mirror-gateway URL`: mirror gateway used by `download_file`.
+
+Gateway format supports:
+
+- Prefix mode: `https://ghproxy.com` (resolved as `https://ghproxy.com/<original_url>`).
+- Template mode: `https://your-gateway/%URL%`.
+
+Fallback behavior:
+
+- For GitHub URLs, script tries mirror first, then original URL automatically.
+- Non-GitHub URLs (such as `nginx.org`) are not rewritten.
+
 ## CLI Parameters (Full)
 
 General:
 
 - `-y`, `--yes`: non-interactive mode.
 - `--dry-run`: print plan only, do not execute install.
+- `--update-waf-only`: update runtime WAF rules only (skip source compile/build flow).
 - `-h`, `--help`: show help.
 
 Service and systemd:
@@ -110,6 +131,7 @@ WAF:
 - `--waf-source local|online`
 - `--online-waf`: shortcut for online source.
 - `--waf-policy required|optional|disabled`
+- `--update-waf-only`: force online WAF repo update flow.
 - `--sync-waf`
 - `--no-sync-waf`
 - `--waf-source-dir PATH`
@@ -117,7 +139,64 @@ WAF:
 - `--waf-ref REF`
 - `--waf-subdir PATH`
 
+Network:
+
+- `--proxy-url URL`
+- `--github-mirror-gateway URL`
+- `--git-mirror-gateway URL`
+- `--download-mirror-gateway URL`
+
+`--update-waf-only` behavior:
+
+- Skips all compile/build steps.
+- Pulls WAF from online repository only (forces `--waf-source online`).
+- Checks runtime WAF installation state.
+- If runtime WAF is missing, checks Lua module support and `lua-resty-http` availability.
+- If runtime support is insufficient, update is skipped safely.
+- On successful update, validates runtime config and reloads running nginx/service.
+- Cannot be used with `--waf-policy disabled`.
+
 ## Quick Start
+
+Online one-liner (run directly from GitHub):
+
+- Script page: `https://github.com/kroyoo/cust0m12a6le/blob/main/nginx/install_nginx.sh`
+- Raw URL: `https://raw.githubusercontent.com/kroyoo/cust0m12a6le/refs/heads/main/nginx/install_nginx.sh`
+
+Dry-run (recommended first):
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/kroyoo/cust0m12a6le/refs/heads/main/nginx/install_nginx.sh)" bash --dry-run
+```
+
+Install/upgrade (manual restart after verification):
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/kroyoo/cust0m12a6le/refs/heads/main/nginx/install_nginx.sh)" bash -y --rewrite-unit --link-bin
+```
+
+WAF hot update only:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/kroyoo/cust0m12a6le/refs/heads/main/nginx/install_nginx.sh)" bash --update-waf-only --waf-policy required
+```
+
+Mainland-friendly online one-liner (proxy + mirror):
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/kroyoo/cust0m12a6le/refs/heads/main/nginx/install_nginx.sh)" bash -y \
+  --proxy-url http://127.0.0.1:7890 \
+  --github-mirror-gateway https://ghproxy.com
+```
+
+Mainland-friendly WAF hot update one-liner:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/kroyoo/cust0m12a6le/refs/heads/main/nginx/install_nginx.sh)" bash --update-waf-only \
+  --waf-policy required \
+  --proxy-url http://127.0.0.1:7890 \
+  --github-mirror-gateway https://ghproxy.com
+```
 
 Dry-run:
 
@@ -141,6 +220,32 @@ Online WAF, non-blocking if repo unavailable:
 
 ```bash
 bash nginx/install_nginx.sh --waf-source online --waf-policy optional \
+  --waf-repo https://github.com/kroyoo/cust0m12a6le.git \
+  --waf-ref main \
+  --waf-subdir waf
+```
+
+Mainland-friendly build (proxy + mirror gateway):
+
+```bash
+bash nginx/install_nginx.sh -y \
+  --proxy-url http://127.0.0.1:7890 \
+  --github-mirror-gateway https://ghproxy.com
+```
+
+Use separate gateways (advanced):
+
+```bash
+bash nginx/install_nginx.sh -y \
+  --git-mirror-gateway https://ghproxy.com \
+  --download-mirror-gateway https://ghproxy.com
+```
+
+WAF hot update only (no compile/build):
+
+```bash
+bash nginx/install_nginx.sh --update-waf-only \
+  --waf-policy required \
   --waf-repo https://github.com/kroyoo/cust0m12a6le.git \
   --waf-ref main \
   --waf-subdir waf

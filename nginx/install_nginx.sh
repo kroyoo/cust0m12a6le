@@ -50,11 +50,16 @@ WAF_REPO_REF="${WAF_REPO_REF:-}"
 WAF_REPO_SUBDIR="${WAF_REPO_SUBDIR:-waf}"
 WAF_POLICY="${WAF_POLICY:-optional}"          # required | optional | disabled
 SYNC_WAF="${SYNC_WAF:-0}"                     # 1/0, sync runtime conf/waf during install flow
+PROXY_URL="${PROXY_URL:-}"                    # e.g. http://127.0.0.1:7890
+GITHUB_MIRROR_GATEWAY="${GITHUB_MIRROR_GATEWAY:-}"   # e.g. https://ghproxy.com
+GIT_MIRROR_GATEWAY="${GIT_MIRROR_GATEWAY:-}"         # clone_repo_once gateway (supports %URL%)
+DOWNLOAD_MIRROR_GATEWAY="${DOWNLOAD_MIRROR_GATEWAY:-}" # download_file gateway (supports %URL%)
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/nginx-source-installer}"
 SERVICE_NAME="${SERVICE_NAME:-nginx}"
 ACTIVATE_SERVICE="${ACTIVATE_SERVICE:-0}"     # 1/0, default off for manual verification before restart
 LINK_NGINX_BIN="${LINK_NGINX_BIN:-0}"         # 1/0, optionally link /usr/bin/nginx
 DRY_RUN="${DRY_RUN:-0}"                       # 1/0, print plan and exit
+UPDATE_WAF_ONLY="${UPDATE_WAF_ONLY:-0}"       # 1/0, update runtime WAF only (skip compile/build)
 REWRITE_UNIT="${REWRITE_UNIT:-1}"             # 1/0, rewrite systemd unit to current/runtime layout
 RELEASES_DIR="${RELEASES_DIR:-}"              # default resolved after args
 CURRENT_LINK="${CURRENT_LINK:-}"              # default resolved after args
@@ -167,6 +172,7 @@ Usage: ${SCRIPT_NAME} [options]
 Options:
   -y, --yes                      Non-interactive mode (skip prompts)
   --dry-run                      Print execution plan and detected paths, then exit
+  --update-waf-only              Update runtime WAF only (skip build/compile flow)
   --activate                     Start/reload ${SERVICE_NAME} after successful install (default: off)
   --link-bin                     Link /usr/bin/nginx to active nginx binary path
   --rewrite-unit                 Rewrite systemd unit to current/runtime layout (default: ${REWRITE_UNIT})
@@ -194,6 +200,11 @@ Options:
   --waf-repo URL                 Online WAF git repo (default: ${WAF_REPO_URL})
   --waf-ref REF                  Online WAF git branch/tag/commit (default: repo default branch)
   --waf-subdir PATH              WAF directory inside repo (default: ${WAF_REPO_SUBDIR})
+  --proxy-url URL                Global proxy URL for git/curl/wget (e.g. http://127.0.0.1:7890)
+  --github-mirror-gateway URL    Set both git/download mirror gateways for GitHub URLs
+                                 gateway supports prefix form or %URL% template
+  --git-mirror-gateway URL       Git clone mirror gateway for GitHub repos
+  --download-mirror-gateway URL  File download mirror gateway for GitHub URLs
   --workdir PATH                 Reuse a specific working directory
   --nginx-version VER            Force Nginx version
   --openssl-version VER          Force OpenSSL version
@@ -204,8 +215,9 @@ Options:
 
 Environment overrides:
   AUTO_LATEST, AUTO_CLEANUP, ASSUME_YES, ENABLE_JEMALLOC, JOBS
-  ACTIVATE_SERVICE, LINK_NGINX_BIN, DRY_RUN, BACKUP_ROOT, SERVICE_NAME
+  ACTIVATE_SERVICE, LINK_NGINX_BIN, DRY_RUN, UPDATE_WAF_ONLY, BACKUP_ROOT, SERVICE_NAME
   REWRITE_UNIT, RELEASES_DIR, CURRENT_LINK, RUNTIME_PREFIX, RELEASE_KEEP
+  PROXY_URL, GITHUB_MIRROR_GATEWAY, GIT_MIRROR_GATEWAY, DOWNLOAD_MIRROR_GATEWAY
   NGINX_PREFIX, NGINX_USER, NGINX_GROUP, LOG_DIR, PID_FILE, LUAJIT_PREFIX, LUA_SHARE_DIR, LUA_CPATH_DIR
   WAF_SOURCE_MODE, WAF_POLICY, SYNC_WAF, WAF_SOURCE_DIR, WAF_REPO_URL, WAF_REPO_REF, WAF_REPO_SUBDIR
   BRAND_MODE (ask|set|keep), BRAND_NAME
@@ -262,6 +274,32 @@ normalize_waf_subdir() {
         *".."*) die "Invalid WAF subdir (path traversal not allowed): ${subdir}" ;;
     esac
     printf '%s\n' "${subdir}"
+}
+
+normalize_proxy_url() {
+    local value="${1:-}"
+    [[ -n "${value}" ]] || { printf '\n'; return 0; }
+    if [[ ! "${value}" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
+        die "Invalid proxy URL: ${value} (expected scheme://host:port)"
+    fi
+    printf '%s\n' "${value}"
+}
+
+normalize_gateway_url() {
+    local name="$1"
+    local value="${2:-}"
+
+    [[ -n "${value}" ]] || { printf '\n'; return 0; }
+    if [[ ! "${value}" =~ ^https?:// ]]; then
+        die "${name} must start with http:// or https://"
+    fi
+    if [[ "${value}" == *$'\n'* ]]; then
+        die "${name} must be a single-line value"
+    fi
+    if [[ "${value}" != *"%URL%"* ]]; then
+        value="${value%/}"
+    fi
+    printf '%s\n' "${value}"
 }
 
 require_option_value() {
@@ -373,6 +411,9 @@ parse_args() {
             --dry-run)
                 DRY_RUN=1
                 ;;
+            --update-waf-only)
+                UPDATE_WAF_ONLY=1
+                ;;
             --activate)
                 ACTIVATE_SERVICE=1
                 ;;
@@ -476,6 +517,26 @@ parse_args() {
                 WAF_REPO_SUBDIR="$2"
                 shift
                 ;;
+            --proxy-url)
+                require_option_value "$1" "$#"
+                PROXY_URL="$2"
+                shift
+                ;;
+            --github-mirror-gateway)
+                require_option_value "$1" "$#"
+                GITHUB_MIRROR_GATEWAY="$2"
+                shift
+                ;;
+            --git-mirror-gateway)
+                require_option_value "$1" "$#"
+                GIT_MIRROR_GATEWAY="$2"
+                shift
+                ;;
+            --download-mirror-gateway)
+                require_option_value "$1" "$#"
+                DOWNLOAD_MIRROR_GATEWAY="$2"
+                shift
+                ;;
             --workdir)
                 require_option_value "$1" "$#"
                 WORKDIR="$2"
@@ -517,6 +578,32 @@ parse_args() {
         esac
         shift
     done
+}
+
+resolve_network_options() {
+    PROXY_URL="$(normalize_proxy_url "${PROXY_URL}")"
+    GITHUB_MIRROR_GATEWAY="$(normalize_gateway_url "GITHUB_MIRROR_GATEWAY" "${GITHUB_MIRROR_GATEWAY}")"
+    GIT_MIRROR_GATEWAY="$(normalize_gateway_url "GIT_MIRROR_GATEWAY" "${GIT_MIRROR_GATEWAY}")"
+    DOWNLOAD_MIRROR_GATEWAY="$(normalize_gateway_url "DOWNLOAD_MIRROR_GATEWAY" "${DOWNLOAD_MIRROR_GATEWAY}")"
+
+    if [[ -n "${GITHUB_MIRROR_GATEWAY}" ]]; then
+        if [[ -z "${GIT_MIRROR_GATEWAY}" ]]; then
+            GIT_MIRROR_GATEWAY="${GITHUB_MIRROR_GATEWAY}"
+        fi
+        if [[ -z "${DOWNLOAD_MIRROR_GATEWAY}" ]]; then
+            DOWNLOAD_MIRROR_GATEWAY="${GITHUB_MIRROR_GATEWAY}"
+        fi
+    fi
+}
+
+apply_network_proxy() {
+    [[ -n "${PROXY_URL}" ]] || return 0
+    export http_proxy="${PROXY_URL}"
+    export https_proxy="${PROXY_URL}"
+    export all_proxy="${PROXY_URL}"
+    export HTTP_PROXY="${PROXY_URL}"
+    export HTTPS_PROXY="${PROXY_URL}"
+    export ALL_PROXY="${PROXY_URL}"
 }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
@@ -629,6 +716,30 @@ detect_os() {
     log_info "Detected OS: ${PRETTY_NAME:-unknown} (${OS_FAMILY})"
 }
 
+is_github_http_url() {
+    local url="${1:-}"
+    [[ "${url}" =~ ^https?://([[:alnum:]-]+\.)?github\.com/ ]]
+}
+
+build_gateway_url() {
+    local raw_url="$1"
+    local gateway="$2"
+    local resolved
+
+    if [[ -z "${gateway}" ]]; then
+        printf '%s\n' "${raw_url}"
+        return 0
+    fi
+
+    if [[ "${gateway}" == *"%URL%"* ]]; then
+        resolved="${gateway//%URL%/${raw_url}}"
+        printf '%s\n' "${resolved}"
+        return 0
+    fi
+
+    printf '%s/%s\n' "${gateway}" "${raw_url}"
+}
+
 fetch_url() {
     local url="$1"
     if command_exists curl; then
@@ -643,11 +754,37 @@ fetch_url() {
 download_file() {
     local url="$1"
     local out="$2"
-    if command_exists curl; then
-        curl -fL --retry 5 --retry-delay 2 --connect-timeout 15 -o "${out}" "${url}"
-    else
-        wget -O "${out}" "${url}"
+    local gateway="${3:-${DOWNLOAD_MIRROR_GATEWAY}}"
+    local current_url
+    local attempt
+    local -a candidates=("${url}")
+
+    if is_github_http_url "${url}" && [[ -n "${gateway}" ]]; then
+        local mirrored_url
+        mirrored_url="$(build_gateway_url "${url}" "${gateway}")"
+        if [[ -n "${mirrored_url}" && "${mirrored_url}" != "${url}" ]]; then
+            candidates=("${mirrored_url}" "${url}")
+        fi
     fi
+
+    for current_url in "${candidates[@]}"; do
+        rm -f "${out}"
+        for attempt in 1 2 3; do
+            if command_exists curl; then
+                if curl -fL --retry 5 --retry-delay 2 --connect-timeout 15 -o "${out}" "${current_url}"; then
+                    return 0
+                fi
+            else
+                if wget -O "${out}" "${current_url}"; then
+                    return 0
+                fi
+            fi
+            sleep $(( attempt * 2 ))
+        done
+        log_warn "Download failed via URL candidate: ${current_url}"
+    done
+
+    die "Failed to download: ${url}"
 }
 
 install_deps_debian() {
@@ -739,6 +876,11 @@ discover_semver_from_github_latest_release() {
 resolve_versions() {
     phase "Resolve version matrix"
 
+    UPDATE_WAF_ONLY="$(normalize_bool "${UPDATE_WAF_ONLY}")"
+    if [[ "${UPDATE_WAF_ONLY}" == "1" ]]; then
+        AUTO_LATEST=0
+    fi
+
     AUTO_LATEST="$(normalize_bool "${AUTO_LATEST}")"
     ENABLE_JEMALLOC="$(normalize_bool "${ENABLE_JEMALLOC}")"
     ASSUME_YES="$(normalize_bool "${ASSUME_YES}")"
@@ -773,8 +915,12 @@ resolve_versions() {
 
     log_kv "Install profile" "release-layout"
     log_kv "Dry run" "${DRY_RUN}"
+    log_kv "Update waf only" "${UPDATE_WAF_ONLY}"
     log_kv "WAF policy" "${WAF_POLICY}"
     log_kv "Sync WAF" "${SYNC_WAF}"
+    log_kv "Proxy URL" "${PROXY_URL:-<none>}"
+    log_kv "Git mirror gateway" "${GIT_MIRROR_GATEWAY:-<none>}"
+    log_kv "Download gateway" "${DOWNLOAD_MIRROR_GATEWAY:-<none>}"
     log_kv "Runtime prefix" "${RUNTIME_PREFIX}"
     log_kv "Releases dir" "${RELEASES_DIR}"
     log_kv "Current link" "${CURRENT_LINK}"
@@ -972,30 +1118,44 @@ clone_repo_once() {
     local repo="$1"
     local dst="$2"
     local ref="$3"
+    local gateway="${4:-${GIT_MIRROR_GATEWAY}}"
     local attempt
+    local current_repo
+    local -a repo_candidates=("${repo}")
+
+    if is_github_http_url "${repo}" && [[ -n "${gateway}" ]]; then
+        local mirrored_repo
+        mirrored_repo="$(build_gateway_url "${repo}" "${gateway}")"
+        if [[ -n "${mirrored_repo}" && "${mirrored_repo}" != "${repo}" ]]; then
+            repo_candidates=("${mirrored_repo}" "${repo}")
+        fi
+    fi
 
     for attempt in 1 2 3; do
-        rm -rf "${dst}"
-        if [[ -n "${ref}" ]]; then
-            if git clone --depth 1 --branch "${ref}" "${repo}" "${dst}" >/dev/null 2>&1; then
-                return 0
-            fi
-        fi
-
-        if git clone --depth 1 "${repo}" "${dst}" >/dev/null 2>&1; then
+        for current_repo in "${repo_candidates[@]}"; do
+            rm -rf "${dst}"
             if [[ -n "${ref}" ]]; then
-                if (
-                    cd "${dst}" &&
-                    (git fetch --depth 1 origin "${ref}" >/dev/null 2>&1 || git fetch --tags --depth 1 >/dev/null 2>&1 || true) &&
-                    git checkout "${ref}" >/dev/null 2>&1
-                ); then
+                if git clone --depth 1 --branch "${ref}" "${current_repo}" "${dst}" >/dev/null 2>&1; then
                     return 0
                 fi
-                rm -rf "${dst}"
-            else
-                return 0
             fi
-        fi
+
+            if git clone --depth 1 "${current_repo}" "${dst}" >/dev/null 2>&1; then
+                if [[ -n "${ref}" ]]; then
+                    if (
+                        cd "${dst}" &&
+                        (git fetch --depth 1 origin "${ref}" >/dev/null 2>&1 || git fetch --tags --depth 1 >/dev/null 2>&1 || true) &&
+                        git checkout "${ref}" >/dev/null 2>&1
+                    ); then
+                        return 0
+                    fi
+                    rm -rf "${dst}"
+                else
+                    return 0
+                fi
+            fi
+            log_warn "Clone failed from ${current_repo}, retrying..."
+        done
         sleep $(( attempt * 2 ))
     done
     return 1
@@ -1382,6 +1542,41 @@ upsert_http_directive() {
     fi
 }
 
+rewrite_waf_templates_for_prefix() {
+    local waf_dir="$1"
+    local conf_prefix="$2"
+    local waf_lua_path_line
+
+    waf_lua_path_line="$(lua_package_path_directive)"
+    if [[ -f "${waf_dir}/waf.conf" ]]; then
+        sed -i "s|/usr/local/nginx/conf|${conf_prefix}|g" "${waf_dir}/waf.conf"
+        if ! replace_first_directive "${waf_dir}/waf.conf" "lua_package_path" "${waf_lua_path_line}"; then
+            if ! grep -Fq "${waf_lua_path_line}" "${waf_dir}/waf.conf"; then
+                sed -i "1i ${waf_lua_path_line}" "${waf_dir}/waf.conf"
+            fi
+        fi
+    fi
+    if [[ -f "${waf_dir}/config.lua" ]]; then
+        sed -i "s|/usr/local/nginx/conf|${conf_prefix}|g" "${waf_dir}/config.lua"
+    fi
+}
+
+ensure_runtime_waf_integration() {
+    local runtime_conf="${RUNTIME_PREFIX}/conf/nginx.conf"
+    local lua_package_path_line lua_package_cpath_line
+
+    [[ -f "${runtime_conf}" ]] || return 1
+    lua_package_path_line="$(lua_package_path_directive)"
+    lua_package_cpath_line="$(lua_package_cpath_directive)"
+
+    cp -a "${runtime_conf}" "${runtime_conf}.waf-update.bak.$(date +%Y%m%d%H%M%S)"
+    upsert_http_directive "${runtime_conf}" "lua_package_path" "${lua_package_path_line}"
+    upsert_http_directive "${runtime_conf}" "lua_package_cpath" "${lua_package_cpath_line}"
+    sed -i -E 's|^[[:space:]]*include[[:space:]]+conf/waf/waf\.conf;[[:space:]]*$|    include waf/waf.conf;|g' "${runtime_conf}"
+    ensure_line_in_http_block "${runtime_conf}" "include waf/waf.conf;"
+    return 0
+}
+
 configure_nginx_conf() {
     local target_prefix="$1"
     phase "Configure nginx.conf"
@@ -1436,7 +1631,6 @@ integrate_waf() {
     local conf_file="${target_prefix}/conf/nginx.conf"
     local waf_target="${target_prefix}/conf/waf"
     local waf_source="${WAF_EFFECTIVE_SOURCE_DIR}"
-    local waf_lua_path_line
 
     if [[ "${WAF_POLICY}" == "disabled" ]]; then
         log_info "WAF policy disabled: skip waf integration."
@@ -1453,19 +1647,7 @@ integrate_waf() {
 
     rm -rf "${waf_target}"
     cp -a "${waf_source}" "${waf_target}"
-
-    if [[ -f "${waf_target}/waf.conf" ]]; then
-        waf_lua_path_line="$(lua_package_path_directive)"
-        sed -i "s|/usr/local/nginx/conf|${NGINX_PREFIX}/conf|g" "${waf_target}/waf.conf"
-        if ! replace_first_directive "${waf_target}/waf.conf" "lua_package_path" "${waf_lua_path_line}"; then
-            if ! grep -Fq "${waf_lua_path_line}" "${waf_target}/waf.conf"; then
-                sed -i "1i ${waf_lua_path_line}" "${waf_target}/waf.conf"
-            fi
-        fi
-    fi
-    if [[ -f "${waf_target}/config.lua" ]]; then
-        sed -i "s|/usr/local/nginx/conf|${NGINX_PREFIX}/conf|g" "${waf_target}/config.lua"
-    fi
+    rewrite_waf_templates_for_prefix "${waf_target}" "${NGINX_PREFIX}/conf"
 
     sed -i -E 's|^[[:space:]]*include[[:space:]]+conf/waf/waf\.conf;[[:space:]]*$|    include waf/waf.conf;|g' "${conf_file}"
     ensure_line_in_http_block "${conf_file}" "include waf/waf.conf;"
@@ -1622,6 +1804,109 @@ sync_runtime_waf_from_release() {
     rm -rf "${dst}"
     cp -a "${src}" "${dst}"
     log_info "Synced runtime waf dir: ${dst}"
+}
+
+runtime_waf_installed() {
+    local runtime_waf_dir="${RUNTIME_PREFIX}/conf/waf"
+    [[ -f "${runtime_waf_dir}/waf.conf" && -f "${runtime_waf_dir}/config.lua" ]]
+}
+
+resolve_active_nginx_binary() {
+    local nginx_bin=""
+
+    if [[ -x "${CURRENT_LINK}/sbin/nginx" ]]; then
+        nginx_bin="${CURRENT_LINK}/sbin/nginx"
+    elif [[ -x "${NGINX_PREFIX}/sbin/nginx" ]]; then
+        nginx_bin="${NGINX_PREFIX}/sbin/nginx"
+    elif command_exists nginx; then
+        nginx_bin="$(command -v nginx 2>/dev/null || true)"
+    fi
+
+    [[ -n "${nginx_bin}" && -x "${nginx_bin}" ]] || return 1
+    printf '%s\n' "${nginx_bin}"
+}
+
+nginx_binary_supports_lua_waf() {
+    local nginx_bin="$1"
+    local nginx_v
+
+    nginx_v="$("${nginx_bin}" -V 2>&1 || true)"
+    grep -Fq -- "lua-nginx-module" <<<"${nginx_v}" || return 1
+    grep -Fq -- "ngx_devel_kit" <<<"${nginx_v}" || return 1
+    return 0
+}
+
+runtime_has_lua_resty_http() {
+    [[ -f "${RUNTIME_PREFIX}/conf/lua/resty/http.lua" || -f "${LUA_SHARE_DIR}/resty/http.lua" ]]
+}
+
+runtime_supports_waf_bootstrap() {
+    local nginx_bin="$1"
+
+    if ! nginx_binary_supports_lua_waf "${nginx_bin}"; then
+        log_warn "Active nginx does not include required Lua modules (lua-nginx-module + ngx_devel_kit)."
+        return 1
+    fi
+    if ! runtime_has_lua_resty_http; then
+        log_warn "lua-resty-http missing in runtime/share path; cannot bootstrap WAF safely."
+        return 1
+    fi
+    return 0
+}
+
+sync_runtime_waf_from_source() {
+    local src="$1"
+    local dst="${RUNTIME_PREFIX}/conf/waf"
+
+    [[ -d "${src}" ]] || die "WAF source dir missing: ${src}"
+    mkdir -p "${RUNTIME_PREFIX}/conf"
+
+    if [[ -d "${dst}" ]]; then
+        local ts backup_dst
+        ts="$(date +%Y%m%d%H%M%S)"
+        backup_dst="${BACKUP_ROOT}/runtime-waf.${ts}.bak"
+        mkdir -p "${BACKUP_ROOT}"
+        cp -a "${dst}" "${backup_dst}"
+        log_info "Backed up runtime waf dir: ${backup_dst}"
+    fi
+
+    rm -rf "${dst}"
+    cp -a "${src}" "${dst}"
+    rewrite_waf_templates_for_prefix "${dst}" "${NGINX_PREFIX}/conf"
+    log_info "Updated runtime waf dir: ${dst}"
+}
+
+reload_runtime_for_waf_update() {
+    local nginx_bin="$1"
+    local nginx_conf_rel="conf/nginx.conf"
+    local lua_path lua_cpath
+
+    lua_path="$(runtime_lua_path "${RUNTIME_PREFIX}")"
+    lua_cpath="$(runtime_lua_cpath "${RUNTIME_PREFIX}")"
+    if command_exists systemctl && systemctl is-active --quiet "${SERVICE_NAME}"; then
+        systemctl reload "${SERVICE_NAME}"
+        log_info "Reloaded service for WAF update: ${SERVICE_NAME}"
+        return 0
+    fi
+
+    if pgrep -x nginx >/dev/null 2>&1; then
+        LUA_PATH="${lua_path}" LUA_CPATH="${lua_cpath}" \
+            "${nginx_bin}" -p "${RUNTIME_PREFIX}/" -c "${nginx_conf_rel}" -s reload
+        log_info "Reloaded nginx master process for WAF update."
+        return 0
+    fi
+
+    log_warn "nginx is not running; WAF files updated, reload manually when ready."
+}
+
+prepare_update_waf_mode() {
+    if [[ "${WAF_POLICY}" == "disabled" ]]; then
+        die "--update-waf-only cannot be used with --waf-policy disabled."
+    fi
+    if [[ "${WAF_SOURCE_MODE}" != "online" ]]; then
+        log_warn "--update-waf-only forces online WAF source; overriding --waf-source to online."
+        WAF_SOURCE_MODE="online"
+    fi
 }
 
 unit_uses_current_layout() {
@@ -1856,6 +2141,9 @@ print_summary() {
     echo "WAF source mode    : ${WAF_SOURCE_MODE}"
     echo "WAF policy         : ${WAF_POLICY}"
     echo "WAF source path    : ${WAF_EFFECTIVE_SOURCE_DIR:-<none>}"
+    echo "Proxy URL          : ${PROXY_URL:-<none>}"
+    echo "Git mirror gateway : ${GIT_MIRROR_GATEWAY:-<none>}"
+    echo "Download gateway   : ${DOWNLOAD_MIRROR_GATEWAY:-<none>}"
     if [[ "${WAF_SOURCE_MODE}" == "online" ]]; then
         echo "WAF repo           : ${WAF_REPO_URL}"
         echo "WAF repo ref       : ${WAF_REPO_REF:-<default branch>}"
@@ -1904,6 +2192,9 @@ print_dry_run_plan() {
     echo "WAF source mode   : ${WAF_SOURCE_MODE}"
     echo "WAF policy        : ${WAF_POLICY}"
     echo "Sync WAF          : ${SYNC_WAF}"
+    echo "Proxy URL         : ${PROXY_URL:-<none>}"
+    echo "Git mirror        : ${GIT_MIRROR_GATEWAY:-<none>}"
+    echo "Download gateway  : ${DOWNLOAD_MIRROR_GATEWAY:-<none>}"
     if [[ "${WAF_SOURCE_MODE}" == "local" ]]; then
         echo "WAF source dir    : ${WAF_EFFECTIVE_SOURCE_DIR:-${WAF_SOURCE_DIR}}"
     else
@@ -1943,11 +2234,105 @@ print_dry_run_plan() {
     echo "  13+) Prune old releases, keeping newest ${RELEASE_KEEP}"
 }
 
+print_update_waf_dry_run_plan() {
+    phase "Dry-run execution plan (update-waf-only)"
+    echo "Execution mode     : update-waf-only"
+    echo "Dry run            : ${DRY_RUN}"
+    echo "Runtime prefix     : ${RUNTIME_PREFIX}"
+    echo "Current link       : ${CURRENT_LINK}"
+    echo "Service name       : ${SERVICE_NAME}"
+    echo "Backup root        : ${BACKUP_ROOT}"
+    echo "WAF source mode    : ${WAF_SOURCE_MODE}"
+    echo "WAF policy         : ${WAF_POLICY}"
+    echo "WAF repo           : ${WAF_REPO_URL}"
+    echo "WAF repo ref       : ${WAF_REPO_REF:-<default branch>}"
+    echo "WAF repo subdir    : ${WAF_REPO_SUBDIR}"
+    echo "Proxy URL          : ${PROXY_URL:-<none>}"
+    echo "Git mirror gateway : ${GIT_MIRROR_GATEWAY:-<none>}"
+    echo "Download gateway   : ${DOWNLOAD_MIRROR_GATEWAY:-<none>}"
+    echo ""
+    echo "Planned steps:"
+    echo "  1) Check runtime nginx binary and runtime conf path"
+    echo "  2) Check whether runtime waf is already installed"
+    echo "  3) If WAF missing, verify Lua module support + lua-resty-http availability"
+    echo "  4) Clone/fetch online WAF repository only (no compile/build)"
+    echo "  5) Replace ${RUNTIME_PREFIX}/conf/waf with repo content"
+    echo "  6) If WAF missing, patch runtime nginx.conf include + Lua package directives"
+    echo "  7) Validate runtime config and reload running nginx/service"
+}
+
 # ----- Orchestration -----------------------------------------------------------
 run_dry_run_flow() {
+    if [[ "${UPDATE_WAF_ONLY}" == "1" ]]; then
+        prepare_update_waf_mode
+        resolve_waf_source
+        print_update_waf_dry_run_plan
+        return 0
+    fi
+
     resolve_waf_source
     resolve_brand
     print_dry_run_plan
+}
+
+run_update_waf_flow() {
+    phase "Update runtime WAF only"
+
+    local runtime_conf="${RUNTIME_PREFIX}/conf/nginx.conf"
+    local nginx_bin=""
+    local waf_installed=0
+
+    prepare_update_waf_mode
+    ensure_root
+
+    if [[ ! -f "${runtime_conf}" ]]; then
+        log_warn "Runtime nginx.conf not found: ${runtime_conf}. Skip --update-waf-only."
+        return 0
+    fi
+
+    if ! nginx_bin="$(resolve_active_nginx_binary)"; then
+        log_warn "Active nginx binary not found. Skip --update-waf-only."
+        return 0
+    fi
+    log_kv "Active nginx bin" "${nginx_bin}"
+
+    if runtime_waf_installed; then
+        waf_installed=1
+        log_info "Runtime WAF installation detected."
+    else
+        log_warn "Runtime WAF not detected under ${RUNTIME_PREFIX}/conf/waf."
+    fi
+
+    if [[ "${waf_installed}" != "1" ]]; then
+        phase "Preflight runtime support for WAF bootstrap"
+        if ! runtime_supports_waf_bootstrap "${nginx_bin}"; then
+            log_warn "Runtime lacks required Lua/WAF support. Skip WAF update."
+            return 0
+        fi
+    fi
+
+    resolve_waf_source
+    prepare_workspace
+    prepare_waf_source
+
+    if [[ -z "${WAF_EFFECTIVE_SOURCE_DIR}" || ! -d "${WAF_EFFECTIVE_SOURCE_DIR}" ]]; then
+        if [[ "${WAF_POLICY}" == "required" ]]; then
+            die "WAF update source unavailable: ${WAF_EFFECTIVE_SOURCE_DIR:-<empty>}"
+        fi
+        log_warn "WAF update source unavailable: ${WAF_EFFECTIVE_SOURCE_DIR:-<empty>} (skip update)"
+        return 0
+    fi
+
+    sync_runtime_waf_from_source "${WAF_EFFECTIVE_SOURCE_DIR}"
+    if [[ "${waf_installed}" != "1" ]]; then
+        if ! ensure_runtime_waf_integration; then
+            log_warn "Runtime nginx.conf missing; skip WAF integration patch."
+        fi
+    fi
+
+    validate_runtime_conf_with_binary "${nginx_bin}"
+    reload_runtime_for_waf_update "${nginx_bin}"
+    log_info "WAF update-only flow completed."
 }
 
 run_install_flow() {
@@ -1978,12 +2363,19 @@ run_install_flow() {
 
 main() {
     parse_args "$@"
+    resolve_network_options
+    apply_network_proxy
     safety_guard
     detect_os
     resolve_versions
 
     if [[ "${DRY_RUN}" == "1" ]]; then
         run_dry_run_flow
+        return 0
+    fi
+
+    if [[ "${UPDATE_WAF_ONLY}" == "1" ]]; then
+        run_update_waf_flow
         return 0
     fi
 
