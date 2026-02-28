@@ -703,6 +703,9 @@ end
 local function handle_challenge_page(ctx, err_msg, continue_raw_override)
     ngx.status = 200
     ngx.header.content_type = "text/html; charset=utf-8"
+    ngx.header["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    ngx.header["Pragma"] = "no-cache"
+    ngx.header["Expires"] = "0"
     local continue_raw = continue_raw_override or page_continue_raw(ctx)
     ngx.say(render_page(ctx, effective_provider(), continue_raw, err_msg))
     return ngx.exit(200)
